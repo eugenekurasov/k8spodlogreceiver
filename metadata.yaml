@@ -1,0 +1,26 @@
+type: k8sapilog
+
+status:
+  class: receiver
+  stability:
+    development: [logs]
+  distributions: []
+  codeowners:
+    active: [YOUR_GITHUB_HANDLE]
+
+# Design goal: collect Kubernetes pod logs via the Kubernetes API server
+# (client-go CoreV1().Pods(ns).GetLogs()) instead of mounting the host
+# filesystem (hostPath) or requiring a DaemonSet with node-level access.
+#
+# Relates to: open-telemetry/opentelemetry-collector-contrib#23339
+# ("New component: k8slog receiver") — proposes an alternative collection
+# mode that avoids the host-root mount security concern raised in that
+# issue by swiatekm-sumo / h0cheung.
+
+tests:
+  config:
+    api_server:
+      qps: 5
+      burst: 10
+    namespaces: []
+    pod_label_selector: ""

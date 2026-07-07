@@ -1,0 +1,52 @@
+# Standalone RBAC reference for k8sapilogreceiver.
+#
+# This file is a FALLBACK for using the receiver in isolation, outside the
+# full observability-stack Helm chart. If you are deploying via the chart
+# (helm/observability-stack), DO NOT apply this file — the chart generates
+# the correct Role or ClusterRole automatically based on `mode` and the
+# `signals.*` flags you enable.
+#
+# What the chart does that this file does not:
+#   - namespace mode: creates a Role + RoleBinding scoped per tenant namespace
+#     instead of a cluster-wide ClusterRole
+#   - includes events get/list/watch when signals.events.enabled is true
+#   - includes service/endpoint permissions when signals.metrics.enabled is true
+#
+# Apply this only when running the receiver standalone (e.g. during local
+# development or component-level testing):
+#
+#   kubectl apply -f deploy/rbac.yaml
+
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: k8sapilog-collector
+  namespace: observability
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: k8sapilog-collector
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["pods/log"]
+    verbs: ["get"]
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: k8sapilog-collector
+subjects:
+  - kind: ServiceAccount
+    name: k8sapilog-collector
+    namespace: observability
+roleRef:
+  kind: ClusterRole
+  name: k8sapilog-collector
+  apiGroup: rbac.authorization.k8s.io

@@ -80,10 +80,18 @@ func (r *logsReceiver) buildRESTConfig() (*rest.Config, error) {
 	var cfg *rest.Config
 	var err error
 
-	if r.cfg.APIConfig.InCluster {
+	switch {
+	case r.cfg.APIConfig.InCluster:
 		cfg, err = rest.InClusterConfig()
-	} else {
+	case r.cfg.APIConfig.KubeconfigPath != "":
 		cfg, err = clientcmd.BuildConfigFromFlags("", r.cfg.APIConfig.KubeconfigPath)
+	default:
+		// No explicit path: honour KUBECONFIG env then fall back to ~/.kube/config,
+		// matching the behaviour of kubectl and client-go's standard tooling.
+		cfg, err = clientcmd.NewNonInteractiveDeferredLoadingClientConfig(
+			clientcmd.NewDefaultClientConfigLoadingRules(),
+			nil,
+		).ClientConfig()
 	}
 	if err != nil {
 		return nil, err

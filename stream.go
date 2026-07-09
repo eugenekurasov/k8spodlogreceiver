@@ -10,6 +10,8 @@ import (
 	"go.uber.org/zap"
 
 	corev1 "k8s.io/api/core/v1"
+
+	"github.com/eugenekurasov/security-observability-stack/otel-components/k8sapilogreceiver/internal/metadata"
 )
 
 // streamContainerLogs tails a single container's logs via the API server
@@ -93,6 +95,7 @@ func (r *logsReceiver) emitLogLine(namespace, podName, containerName, line strin
 	res.Attributes().PutStr("k8s.container.name", containerName)
 
 	sl := rl.ScopeLogs().AppendEmpty()
+	sl.Scope().SetName(metadata.ScopeName)
 	lr := sl.LogRecords().AppendEmpty()
 	lr.SetTimestamp(pcommon.NewTimestampFromTime(time.Now()))
 	lr.Body().SetStr(line)

@@ -6,51 +6,32 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/apimachinery/pkg/watch"
+	"k8s.io/client-go/informers"
 	"k8s.io/client-go/tools/cache"
-	"k8s.io/client-go/util/workqueue"
 )
 
-// runPodInformer watches pods matching the configured namespace/label
-// selector and starts/stops a log-streaming goroutine per container as
-// pods come and go. Using an informer (rather than polling) keeps API
-// server load low and reacts to pod lifecycle events promptly.
 func (r *logsReceiver) runPodInformer(ctx context.Context) {
 	defer r.wg.Done()
-
-	queue := workqueue.NewTypedRateLimitingQueue[string](
-		workqueue.DefaultTypedControllerRateLimiter[string](),
-	)
-	defer queue.ShutDown()
-
-	listOpts := func(opts *metav1.ListOptions) {
-		opts.LabelSelector = r.cfg.PodLabelSelector
-	}
 
 	namespaces := r.cfg.Namespaces
 	if len(namespaces) == 0 {
 		namespaces = []string{metav1.NamespaceAll}
 	}
 
-	for _, ns := range namespaces {
-		informer := cache.NewSharedIndexInformer(
-			&cache.ListWatch{
-				ListFunc: func(options metav1.ListOptions) (runtime.Object, error) {
-					listOpts(&options)
-					return r.clientset.CoreV1().Pods(ns).List(ctx, options)
-				},
-				WatchFunc: func(options metav1.ListOptions) (watch.Interface, error) {
-					listOpts(&options)
-					return r.clientset.CoreV1().Pods(ns).Watch(ctx, options)
-				},
-			},
-			&corev1.Pod{},
-			30*time.Second,
-			cache.Indexers{},
-		)
+	tweakOpts := informers.WithTweakListOptions(func(opts *metav1.ListOptions) {
+		opts.LabelSelector = r.cfg.PodLabelSelector
+	})
 
-		_, _ = informer.AddEventHandler(cache.ResourceEventHandlerFuncs{
+	for _, ns := range namespaces {
+		var factory informers.SharedInformerFactory
+		if ns == metav1.NamespaceAll {
+			factory = informers.NewSharedInformerFactoryWithOptions(r.clientset, 30*time.Second, tweakOpts)
+		} else {
+			factory = informers.NewSharedInformerFactoryWithOptions(r.clientset, 30*time.Second, informers.WithNamespace(ns), tweakOpts)
+		}
+
+		podInformer := factory.Core().V1().Pods().Informer()
+		_, _ = podInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
 			AddFunc: func(obj interface{}) {
 				pod := obj.(*corev1.Pod)
 				r.onPodAdded(ctx, pod)
@@ -67,7 +48,7 @@ func (r *logsReceiver) runPodInformer(ctx context.Context) {
 		r.wg.Add(1)
 		go func() {
 			defer r.wg.Done()
-			informer.Run(ctx.Done())
+			podInformer.Run(ctx.Done())
 		}()
 	}
 

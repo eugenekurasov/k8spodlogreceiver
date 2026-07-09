@@ -7,9 +7,9 @@ import (
 	"go.opentelemetry.io/collector/component"
 	"go.opentelemetry.io/collector/consumer"
 	"go.opentelemetry.io/collector/receiver"
-)
 
-var componentType = component.MustNewType("k8sapilog")
+	"github.com/eugenekurasov/security-observability-stack/otel-components/k8sapilogreceiver/internal/metadata"
+)
 
 // NewFactory creates a factory for the k8sapilog receiver, following the
 // standard OpenTelemetry Collector Contrib component conventions (see
@@ -17,9 +17,9 @@ var componentType = component.MustNewType("k8sapilog")
 // pattern applied to a different transport).
 func NewFactory() receiver.Factory {
 	return receiver.NewFactory(
-		componentType,
+		metadata.Type,
 		createDefaultConfig,
-		receiver.WithLogs(createLogsReceiver, component.StabilityLevelDevelopment),
+		receiver.WithLogs(createLogsReceiver, metadata.LogsStability),
 	)
 }
 

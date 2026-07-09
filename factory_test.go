@@ -7,15 +7,16 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"go.opentelemetry.io/collector/component"
 	"go.opentelemetry.io/collector/consumer/consumertest"
 	"go.opentelemetry.io/collector/receiver/receivertest"
+
+	"github.com/eugenekurasov/security-observability-stack/otel-components/k8sapilogreceiver/internal/metadata"
 )
 
 func TestNewFactory_Type(t *testing.T) {
 	f := NewFactory()
 	require.NotNil(t, f)
-	assert.Equal(t, component.MustNewType("k8sapilog"), f.Type())
+	assert.Equal(t, metadata.Type, f.Type())
 }
 
 func TestCreateDefaultConfig_Defaults(t *testing.T) {
@@ -38,7 +39,7 @@ func TestCreateDefaultConfig_Validates(t *testing.T) {
 func TestCreateLogsReceiver(t *testing.T) {
 	f := NewFactory()
 	cfg := f.CreateDefaultConfig()
-	r, err := f.CreateLogs(context.Background(), receivertest.NewNopSettings(), cfg, &consumertest.LogsSink{})
+	r, err := f.CreateLogs(context.Background(), receivertest.NewNopSettings(f.Type()), cfg, &consumertest.LogsSink{})
 	require.NoError(t, err)
 	require.NotNil(t, r)
 }

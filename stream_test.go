@@ -9,6 +9,8 @@ import (
 	"github.com/stretchr/testify/require"
 	"go.opentelemetry.io/collector/consumer/consumertest"
 	"go.opentelemetry.io/collector/receiver/receivertest"
+
+	"github.com/eugenekurasov/security-observability-stack/otel-components/k8sapilogreceiver/internal/metadata"
 )
 
 // ---- nextBackoff ----
@@ -58,23 +60,25 @@ func TestSleepOrDone_CancelDuringWait(t *testing.T) {
 func TestEmitLogLine_PopulatesResourceAttributes(t *testing.T) {
 	sink := &consumertest.LogsSink{}
 	r := &logsReceiver{
-		settings: receivertest.NewNopSettings(),
+		settings: receivertest.NewNopSettings(metadata.Type),
 		consumer: sink,
 	}
 
 	r.emitLogLine("payments", "app-abc", "api", "hello world")
 
 	require.Len(t, sink.AllLogs(), 1)
-	attrs := sink.AllLogs()[0].ResourceLogs().At(0).Resource().Attributes().AsRaw()
+	rl := sink.AllLogs()[0].ResourceLogs().At(0)
+	attrs := rl.Resource().Attributes().AsRaw()
 	assert.Equal(t, "payments", attrs["k8s.namespace.name"])
 	assert.Equal(t, "app-abc", attrs["k8s.pod.name"])
 	assert.Equal(t, "api", attrs["k8s.container.name"])
+	assert.Equal(t, metadata.ScopeName, rl.ScopeLogs().At(0).Scope().Name())
 }
 
 func TestEmitLogLine_PopulatesBody(t *testing.T) {
 	sink := &consumertest.LogsSink{}
 	r := &logsReceiver{
-		settings: receivertest.NewNopSettings(),
+		settings: receivertest.NewNopSettings(metadata.Type),
 		consumer: sink,
 	}
 
@@ -88,7 +92,7 @@ func TestEmitLogLine_PopulatesBody(t *testing.T) {
 func TestEmitLogLine_SetsTimestamp(t *testing.T) {
 	sink := &consumertest.LogsSink{}
 	r := &logsReceiver{
-		settings: receivertest.NewNopSettings(),
+		settings: receivertest.NewNopSettings(metadata.Type),
 		consumer: sink,
 	}
 

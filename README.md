@@ -29,6 +29,7 @@ Kubernetes RBAC on the `pods/log` subresource.
 | Compute cost               | One collector pod per node   | One (or few) pods per tenant, on cheap CPU nodes      |
 | Intra-cluster network      | None (local file read)       | Log data traverses the API server — negligible on EKS/GKE (managed, auto-scaled control plane); worth planning for on self-hosted clusters with a fixed-spec API server |
 | RBAC granularity           | Node-level                   | Namespace / label-selector scoped                     |
+| Serverless node pools (Fargate, AKS Virtual Nodes, GCP Autopilot) | Not supported — DaemonSets are blocked or restricted on these platforms; `hostPath` mounts are unavailable | Fully supported — plain Deployment, no DaemonSet or `hostPath` required; API endpoint is the same regardless of underlying node type |
 | Log continuity on rotation | Direct file access, robust   | Depends on kubelet log retention                      |
 
 ## Intentional scope
@@ -93,10 +94,11 @@ service:
 
 - **API server load at scale**: one persistent HTTP stream per container.
   On managed clusters (EKS, GKE) the control plane is auto-scaled by the
-  cloud provider and this is not a meaningful concern. On self-managed
-  clusters with a fixed-spec API server, a large pod count may need
-  sharding across multiple collector replicas with a per-instance
-  namespace or label-selector partition.
+  cloud provider and this is not a meaningful concern. On self-hosted
+  clusters the standard solution is a kube-apiserver HA setup — a load
+  balancer in front of multiple API server replicas (the kubeadm HA
+  pattern) distributes the streaming connections across replicas and
+  removes the single-instance bottleneck without changes to the collector.
 - **Log rotation gaps**: if a stream is disconnected longer than the
   kubelet's retained rotated logs, some lines are unrecoverable. A
   hostPath-based collector doesn't have this limitation. Worth

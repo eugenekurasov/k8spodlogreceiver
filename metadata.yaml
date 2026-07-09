@@ -6,7 +6,7 @@ status:
     development: [logs]
   distributions: []
   codeowners:
-    active: [YOUR_GITHUB_HANDLE]
+    active: [eugenekurasov]
 
 # Design goal: collect Kubernetes pod logs via the Kubernetes API server
 # (client-go CoreV1().Pods(ns).GetLogs()) instead of mounting the host
@@ -19,7 +19,10 @@ status:
 
 tests:
   config:
-    api_server:
+    api_config:
+      in_cluster: false
+      kubeconfig_path: testdata/kubeconfig-nontls.yaml
+    rate_limit:
       qps: 5
       burst: 10
     namespaces: []

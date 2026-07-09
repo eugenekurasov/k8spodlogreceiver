@@ -19,7 +19,7 @@
 //   - is scoped by standard Kubernetes RBAC on the "pods/log" subresource,
 //     so access can be restricted per-namespace or per-label-selector —
 //     a natural fit for multi-tenant clusters with compliance
-//     requirements (e.g., SOC 2 / HIPAA log-access boundaries);
+//     requirements (e.g., SOC 2 log-access boundaries);
 //   - reuses the same code path already trusted for `kubectl logs`.
 //
 // Trade-offs (see README.md for details): higher API server load at

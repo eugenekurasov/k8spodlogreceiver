@@ -20,6 +20,9 @@ proposes a `k8slog` receiver that mounts the node's log directory
 privilege grant for a narrow task. This project explores an alternative:
 collecting logs purely through the API server, scoped by ordinary
 Kubernetes RBAC on the `pods/log` subresource.
+[open-telemetry/opentelemetry-collector-contrib#24641](https://github.com/open-telemetry/opentelemetry-collector-contrib/issues/24641) Propose a New component: Kubernetes api logs receiver 
+but the issue was closed as inactive.
+
 
 |                            | hostPath + DaemonSet         | k8sapilog (this project)                              |
 |----------------------------|------------------------------|-------------------------------------------------------|
@@ -47,7 +50,7 @@ This is a deliberate scope choice. The target user is a **tenant team** that wan
 Because access is mediated entirely by the Kubernetes API and scoped via
 RBAC, a single cluster can run per-tenant collector instances that are
 only authorized to read logs for their own namespace(s) — useful for
-environments with SOC 2 / HIPAA-style log-access segregation
+environments with SOC 2-style log-access segregation
 requirements, without relying on node-level trust boundaries.
 
 ## Quick start

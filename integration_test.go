@@ -80,7 +80,9 @@ func TestIntegration_LogsArrive(t *testing.T) {
 		InCluster: false, // uses default kubeconfig; kind sets it in CI
 	}
 	cfg.Namespaces = []string{integrationNamespace}
-	cfg.SinceSeconds = 0 // read from the beginning of the log
+	// SinceSeconds left nil (factory default): full available history, so the marker
+	// printed once at pod startup is still read even if the receiver's
+	// stream attaches after the line was already written.
 
 	recv, err := factory.CreateLogs(ctx, receivertest.NewNopSettings(metadata.Type), cfg, sink)
 	require.NoError(t, err)

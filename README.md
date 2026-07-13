@@ -91,9 +91,6 @@ receivers:
     namespaces: ["payments", "billing"]
     pod_label_selector: "app.kubernetes.io/part-of=payments-platform"
     since_seconds: 300
-    rate_limit:
-      qps: 5
-      burst: 10
 
 exporters:
   otlp:
@@ -105,6 +102,60 @@ service:
       receivers: [k8s_podlog]
       exporters: [otlp]
 ```
+
+## Configuration reference
+
+The [Quick start](#quick-start) above covers deploying the receiver *via
+the Helm chart*, which sets these fields for you from `values.yaml`. This
+section documents the receiver's own configuration surface directly, for
+anyone hand-writing a collector config or embedding this component in a
+different distribution.
+
+```yaml
+receivers:
+  k8s_podlog:
+    api_config:
+      in_cluster: true
+    namespaces: ["payments", "billing"]
+    exclude_namespaces:
+      - regexp: "^kube-.*"
+    pod_label_selector: "app.kubernetes.io/part-of=payments-platform"
+    since_seconds: 300
+    reconnect_backoff:
+      initial_interval: 1s
+      max_interval: 30s
+      max_elapsed_time: 5m
+```
+
+- `api_config.in_cluster` (default `true`): use the pod's mounted
+  ServiceAccount token. Set to `false` for local development, together with
+  `api_config.kubeconfig_path`.
+- `api_config.kubeconfig_path`: path to a kubeconfig file, used only when
+  `in_cluster` is `false`.
+- `namespaces`: restrict log collection to these namespaces. Empty (default)
+  means all namespaces visible to the ServiceAccount's RBAC.
+- `exclude_namespaces`: list of `strict` or `regexp` matchers
+  ([`go.opentelemetry.io/collector/filter`](https://pkg.go.dev/go.opentelemetry.io/collector/filter))
+  excluding namespaces that would otherwise be included.
+- `pod_label_selector`: only watch pods matching this label selector, e.g.
+  `"app.kubernetes.io/part-of=payments"`.
+- `since_seconds`: how far back into existing logs to read when a
+  pod/container is first discovered (mirrors `kubectl logs --since`).
+  Three states:
+  - unset / key absent (default): full available log history (whatever the
+    kubelet still has retained), no bound.
+  - `0`: fresh logs only — no historical backfill, just lines written after
+    the stream connects.
+  - `N > 0`: last `N` seconds of history.
+
+  Set an explicit bound in production to avoid a thundering-herd re-read of
+  full available log history across every container on collector restart.
+- `reconnect_backoff.initial_interval` / `max_interval` / `max_elapsed_time`:
+  exponential backoff applied when a log stream drops (pod restart, kubelet
+  log rotation, transient API server error) before reconnecting.
+
+The full field definitions live in [`config.go`](./config.go), with a
+working sample in [`testdata/config.yaml`](./testdata/config.yaml).
 
 ## Known limitations / open questions
 

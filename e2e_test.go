@@ -62,7 +62,8 @@ func baseConfig(t *testing.T) *Config {
 	cfg := factory.CreateDefaultConfig().(*Config)
 	cfg.APIConfig.InCluster = false
 	cfg.APIConfig.KubeconfigPath = kubeconfig(t)
-	cfg.SinceSeconds = 300
+	sinceSeconds := int64(300)
+	cfg.SinceSeconds = &sinceSeconds
 	return cfg
 }
 

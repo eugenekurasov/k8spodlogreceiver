@@ -28,7 +28,7 @@ func createDefaultConfig() component.Config {
 		APIConfig: APIConfig{
 			InCluster: true,
 		},
-		SinceSeconds: 300,
+		SinceSeconds: nil, // full available history by default; set explicitly to bound it
 		ReconnectBackoff: ReconnectBackoffConfig{
 			InitialInterval: 1 * time.Second,
 			MaxInterval:     30 * time.Second,

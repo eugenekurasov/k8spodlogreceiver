@@ -11,22 +11,31 @@ import (
 
 func TestConfigValidate_Valid(t *testing.T) {
 	cfg := &Config{
-		SinceSeconds: 0,
+		SinceSeconds: nil,
 	}
 	assert.NoError(t, componenttest.CheckConfigStruct(cfg))
 	require.NoError(t, cfg.Validate())
 }
 
 func TestConfigValidate_NegativeSinceSeconds(t *testing.T) {
+	negative := int64(-1)
 	cfg := &Config{
-		SinceSeconds: -1,
+		SinceSeconds: &negative,
 	}
 	assert.Error(t, cfg.Validate())
 }
 
 func TestConfigValidate_ZeroSinceSeconds(t *testing.T) {
+	zero := int64(0)
 	cfg := &Config{
-		SinceSeconds: 0,
+		SinceSeconds: &zero,
+	}
+	assert.NoError(t, cfg.Validate())
+}
+
+func TestConfigValidate_NilSinceSeconds(t *testing.T) {
+	cfg := &Config{
+		SinceSeconds: nil,
 	}
 	assert.NoError(t, cfg.Validate())
 }

@@ -23,7 +23,7 @@ func TestCreateDefaultConfig_Defaults(t *testing.T) {
 	cfg := createDefaultConfig().(*Config)
 
 	assert.True(t, cfg.APIConfig.InCluster)
-	assert.Equal(t, int64(300), cfg.SinceSeconds)
+	assert.Nil(t, cfg.SinceSeconds)
 	assert.Equal(t, 1*time.Second, cfg.ReconnectBackoff.InitialInterval)
 	assert.Equal(t, 30*time.Second, cfg.ReconnectBackoff.MaxInterval)
 	assert.Equal(t, 5*time.Minute, cfg.ReconnectBackoff.MaxElapsedTime)

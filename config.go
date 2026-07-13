@@ -33,9 +33,15 @@ type Config struct {
 
 	// SinceSeconds bounds how far back into existing logs to read when a
 	// new pod/container is first discovered (mirrors `kubectl logs
-	// --since`). Prevents a thundering-herd re-read of full log history
-	// on collector restart.
-	SinceSeconds int64 `mapstructure:"since_seconds"`
+	// --since`). Three states, distinguished via the pointer so "not set"
+	// and "explicitly zero" don't collide:
+	//   - nil (key absent from config): full available log history
+	//     (whatever the kubelet still has retained), no bound.
+	//   - pointer to 0: fresh logs only, no historical backfill.
+	//   - pointer to N > 0: last N seconds of history.
+	// Set an explicit bound in production to avoid a thundering-herd
+	// re-read of full available log history on collector restart.
+	SinceSeconds *int64 `mapstructure:"since_seconds"`
 
 	// ReconnectBackoff controls the retry/backoff behavior when a log
 	// stream from the kubelet is interrupted (rotation, pod restart,
@@ -71,7 +77,7 @@ var (
 // Validate checks the receiver configuration for obvious misconfigurations
 // before the collector starts.
 func (cfg *Config) Validate() error {
-	if cfg.SinceSeconds < 0 {
+	if cfg.SinceSeconds != nil && *cfg.SinceSeconds < 0 {
 		return errors.New("k8spodlogreceiver: since_seconds must be >= 0")
 	}
 	return nil

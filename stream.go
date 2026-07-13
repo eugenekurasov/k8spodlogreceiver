@@ -35,7 +35,7 @@ func (r *logsReceiver) streamContainerLogs(ctx context.Context, namespace, podNa
 	)
 
 	backoff := r.cfg.ReconnectBackoff.InitialInterval
-	var sinceSeconds *int64 = &r.cfg.SinceSeconds
+	sinceSeconds := r.cfg.SinceSeconds
 
 	for {
 		select {

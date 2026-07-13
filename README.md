@@ -206,7 +206,7 @@ kind create cluster --name k8spodlog-test --image kindest/node:v1.34.8
 ```bash
 cd otel-components/k8spodlogreceiver
 go mod vendor  # only if vendor/ doesn't already exist
-go test -v -mod=vendor -tags integration -timeout 120s ./...
+go test -v -mod=vendor -tags integration -timeout 180s ./...
 ```
 
 `kind create cluster` sets `kind-k8spodlog-test` as your current

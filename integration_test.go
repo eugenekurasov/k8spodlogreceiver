@@ -27,14 +27,18 @@ const (
 	integrationNamespace = "k8spodlog-inttest"
 	integrationPodName   = "log-emitter"
 	integrationMarker    = "k8spodlog-integration-marker"
-	integrationTimeout   = 60 * time.Second
+	// 120s rather than a tighter bound: under CI resource contention (three
+	// kind clusters spinning up concurrently via Docker-in-Docker on a
+	// shared runner), image pull/scheduling for the test pod can occasionally
+	// take longer than a minute even though the receiver itself is working.
+	integrationTimeout = 120 * time.Second
 )
 
 // TestIntegration_LogsArrive starts the receiver against a real kind cluster,
 // creates a pod that emits a known marker line, and asserts the line arrives
 // at the consumer with correct resource attributes.
 //
-// Run with: go test -v -mod=vendor -tags integration -timeout 120s ./...
+// Run with: go test -v -mod=vendor -tags integration -timeout 180s ./...
 func TestIntegration_LogsArrive(t *testing.T) {
 	// Uses KUBECONFIG env (set by helm/kind-action in CI) or ~/.kube/config locally.
 	restCfg, err := clientcmd.NewNonInteractiveDeferredLoadingClientConfig(

@@ -17,6 +17,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
 
 	"github.com/eugenekurasov/security-observability-stack/otel-components/k8spodlogreceiver/internal/metadata"
@@ -41,7 +42,15 @@ func TestIntegration_LogsArrive(t *testing.T) {
 	).ClientConfig()
 	require.NoError(t, err, "load kubeconfig — is a cluster running?")
 
-	k8sClient, err := kubernetes.NewForConfig(restCfg)
+	// Built via an explicit http.Client (rather than kubernetes.NewForConfig,
+	// which hides it) so idle keep-alive connections can be force-closed in
+	// t.Cleanup — otherwise their HTTP/2 read-loop goroutines outlive the
+	// test and trip goleak.
+	httpClient, err := rest.HTTPClientFor(restCfg)
+	require.NoError(t, err)
+	t.Cleanup(func() { httpClient.CloseIdleConnections() })
+
+	k8sClient, err := kubernetes.NewForConfigAndClient(restCfg, httpClient)
 	require.NoError(t, err)
 
 	ctx := context.Background()

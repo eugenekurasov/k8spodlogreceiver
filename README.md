@@ -157,6 +157,74 @@ receivers:
 The full field definitions live in [`config.go`](./config.go), with a
 working sample in [`testdata/config.yaml`](./testdata/config.yaml).
 
+## Running tests locally
+
+### Unit tests
+
+No external dependencies:
+
+```bash
+cd otel-components/k8spodlogreceiver
+go test -v ./...
+```
+
+### Integration tests
+
+These run [`TestIntegration_LogsArrive`](./integration_test.go) against a
+real Kubernetes cluster — a pod is created that emits a marker log line,
+and the test asserts the receiver reads it back through the full
+informer → stream → consumer path.
+
+**Prerequisites**
+
+- [Docker Desktop](https://www.docker.com/products/docker-desktop/) (or
+  another local Docker daemon), running.
+- [`kind`](https://kind.sigs.k8s.io/), installed via Homebrew:
+
+  ```bash
+  brew install kind
+  ```
+
+- On macOS with Docker Desktop, the daemon socket isn't at the usual
+  `/var/run/docker.sock` — export `DOCKER_HOST` so `kind`/`docker` find it:
+
+  ```bash
+  export DOCKER_HOST="unix://$HOME/.docker/run/docker.sock"
+  ```
+
+**Create a cluster** (any recent `kindest/node` tag works — see
+[kind releases](https://github.com/kubernetes-sigs/kind/releases) for
+current ones):
+
+```bash
+kind create cluster --name k8spodlog-test --image kindest/node:v1.34.8
+```
+
+**Run the tests** (`-mod=vendor` needs a populated `vendor/` — run
+`go mod vendor` first if you don't already have one):
+
+```bash
+cd otel-components/k8spodlogreceiver
+go mod vendor  # only if vendor/ doesn't already exist
+go test -v -mod=vendor -tags integration -timeout 120s ./...
+```
+
+`kind create cluster` sets `kind-k8spodlog-test` as your current
+`kubectl` context and merges it into `~/.kube/config`, which is what the
+test picks up by default (or set `KUBECONFIG` to point elsewhere).
+
+**Clean up** when done:
+
+```bash
+kind delete cluster --name k8spodlog-test
+```
+
+If you re-run the tests immediately after a previous run, you may see
+`object is being deleted: namespaces "k8spodlog-inttest" already exists`
+— that's just the previous run's namespace still terminating (Kubernetes
+namespace deletion isn't instant), not a real failure. Wait a few seconds
+and retry.
+
 ## Known limitations / open questions
 
 - **API server load at scale**: one persistent HTTP stream per container.

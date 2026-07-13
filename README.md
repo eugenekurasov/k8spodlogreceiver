@@ -1,4 +1,4 @@
-# k8sapilog receiver
+# k8spodlog receiver
 
 An OpenTelemetry Collector receiver that streams Kubernetes pod logs via
 the Kubernetes API server — the same mechanism `kubectl logs -f` uses —
@@ -12,6 +12,19 @@ node-level access.
 [open issues](#known-limitations--open-questions) before relying on this
 in production.
 
+## Kubernetes version compatibility
+
+| Kubernetes | Status |
+|---|---|
+| 1.36 | CI configured — pending first run |
+| 1.35 | CI configured — pending first run |
+| 1.34 | CI configured — pending first run |
+
+All APIs used by this receiver are stable `core/v1` endpoints (`pods`,
+`pods/log`) present and unchanged since Kubernetes 1.3. Label selectors
+on List/Watch are stable since 1.0. There are no alpha or beta API
+dependencies.
+
 ## Why this exists
 
 [open-telemetry/opentelemetry-collector-contrib#23339](https://github.com/open-telemetry/opentelemetry-collector-contrib/issues/23339)
@@ -24,7 +37,7 @@ Kubernetes RBAC on the `pods/log` subresource.
 but the issue was closed as inactive.
 
 
-|                            | hostPath + DaemonSet         | k8sapilog (this project)                              |
+|                            | hostPath + DaemonSet         | k8spodlog (this project)                              |
 |----------------------------|------------------------------|-------------------------------------------------------|
 | Node filesystem access     | Yes (read-only host mount)   | None                                                  |
 | Deployment shape           | DaemonSet (one per node)     | Deployment (one per tenant, any node)                 |
@@ -74,7 +87,7 @@ Example collector config:
 
 ```yaml
 receivers:
-  k8sapilog:
+  k8s_podlog:
     namespaces: ["payments", "billing"]
     pod_label_selector: "app.kubernetes.io/part-of=payments-platform"
     since_seconds: 300
@@ -89,7 +102,7 @@ exporters:
 service:
   pipelines:
     logs:
-      receivers: [k8sapilog]
+      receivers: [k8s_podlog]
       exporters: [otlp]
 ```
 

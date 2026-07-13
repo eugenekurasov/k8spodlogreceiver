@@ -1,4 +1,4 @@
-package k8sapilogreceiver
+package k8spodlogreceiver
 
 import (
 	"bufio"
@@ -11,7 +11,7 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 
-	"github.com/eugenekurasov/security-observability-stack/otel-components/k8sapilogreceiver/internal/metadata"
+	"github.com/eugenekurasov/security-observability-stack/otel-components/k8spodlogreceiver/internal/metadata"
 )
 
 // streamContainerLogs tails a single container's logs via the API server

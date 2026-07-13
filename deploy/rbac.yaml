@@ -1,4 +1,4 @@
-# Standalone RBAC reference for k8sapilogreceiver.
+# Standalone RBAC reference for k8spodlogreceiver.
 #
 # This file is a FALLBACK for using the receiver in isolation, outside the
 # full observability-stack Helm chart. If you are deploying via the chart
@@ -20,13 +20,13 @@
 apiVersion: v1
 kind: ServiceAccount
 metadata:
-  name: k8sapilog-collector
+  name: k8spodlog-collector
   namespace: observability
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
-  name: k8sapilog-collector
+  name: k8spodlog-collector
 rules:
   - apiGroups: [""]
     resources: ["pods"]
@@ -41,12 +41,12 @@ rules:
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
 metadata:
-  name: k8sapilog-collector
+  name: k8spodlog-collector
 subjects:
   - kind: ServiceAccount
-    name: k8sapilog-collector
+    name: k8spodlog-collector
     namespace: observability
 roleRef:
   kind: ClusterRole
-  name: k8sapilog-collector
+  name: k8spodlog-collector
   apiGroup: rbac.authorization.k8s.io

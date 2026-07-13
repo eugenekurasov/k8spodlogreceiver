@@ -1,4 +1,4 @@
-package k8sapilogreceiver
+package k8spodlogreceiver
 
 import (
 	"context"

@@ -1,4 +1,4 @@
-// Package k8sapilogreceiver collects Kubernetes pod logs by streaming them
+// Package k8spodlogreceiver collects Kubernetes pod logs by streaming them
 // through the Kubernetes API server (the same path `kubectl logs -f` uses),
 // instead of requiring a DaemonSet with a read-only host-root mount.
 //
@@ -27,4 +27,4 @@
 // direct file access, which means aggressive log rotation on the node can
 // cause small gaps if the receiver is disconnected for longer than the
 // kubelet retains rotated logs.
-package k8sapilogreceiver
+package k8spodlogreceiver

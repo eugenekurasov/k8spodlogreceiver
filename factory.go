@@ -1,4 +1,4 @@
-package k8sapilogreceiver
+package k8spodlogreceiver
 
 import (
 	"context"
@@ -8,10 +8,10 @@ import (
 	"go.opentelemetry.io/collector/consumer"
 	"go.opentelemetry.io/collector/receiver"
 
-	"github.com/eugenekurasov/security-observability-stack/otel-components/k8sapilogreceiver/internal/metadata"
+	"github.com/eugenekurasov/security-observability-stack/otel-components/k8spodlogreceiver/internal/metadata"
 )
 
-// NewFactory creates a factory for the k8sapilog receiver, following the
+// NewFactory creates a factory for the k8spodlog receiver, following the
 // standard OpenTelemetry Collector Contrib component conventions (see
 // receiver/filelogreceiver for a reference implementation of the same
 // pattern applied to a different transport).
@@ -33,10 +33,6 @@ func createDefaultConfig() component.Config {
 			InitialInterval: 1 * time.Second,
 			MaxInterval:     30 * time.Second,
 			MaxElapsedTime:  5 * time.Minute,
-		},
-		RateLimit: RateLimitConfig{
-			QPS:   5,
-			Burst: 10,
 		},
 	}
 }

@@ -1,4 +1,4 @@
-package k8sapilogreceiver
+package k8spodlogreceiver
 
 import (
 	"context"
@@ -50,12 +50,12 @@ func newLogsReceiver(settings receiver.Settings, cfg *Config, c consumer.Logs) (
 func (r *logsReceiver) Start(_ context.Context, _ component.Host) error {
 	restCfg, err := r.buildRESTConfig()
 	if err != nil {
-		return fmt.Errorf("k8sapilogreceiver: building kube client config: %w", err)
+		return fmt.Errorf("k8spodlogreceiver: building kube client config: %w", err)
 	}
 
 	clientset, err := kubernetes.NewForConfig(restCfg)
 	if err != nil {
-		return fmt.Errorf("k8sapilogreceiver: %w (%v)", errNoRBACHint, err)
+		return fmt.Errorf("k8spodlogreceiver: %w (%v)", errNoRBACHint, err)
 	}
 	r.clientset = clientset
 
@@ -97,7 +97,5 @@ func (r *logsReceiver) buildRESTConfig() (*rest.Config, error) {
 		return nil, err
 	}
 
-	cfg.QPS = r.cfg.RateLimit.QPS
-	cfg.Burst = r.cfg.RateLimit.Burst
 	return cfg, nil
 }

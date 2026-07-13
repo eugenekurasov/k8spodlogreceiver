@@ -1,0 +1,28 @@
+receivers:
+  k8s_podlog:
+    namespaces: payment,api-gateway
+    pod_label_selector: app.kubernetes.io/part-of=payments
+    since_seconds: 300
+    api_config:
+      in_cluster: true
+    reconnect_backoff:
+      initialInterval: 1s
+      maxInterval: 30s
+      maxElapsedTime: 5m
+
+processors:
+  nop:
+
+exporters:
+  nop:
+
+service:
+  pipelines:
+    traces:
+      receivers: [azure_blob]
+      processors: [nop]
+      exporters: [nop]
+    logs:
+      receivers: [azure_blob]
+      processors: [nop]
+      exporters: [nop]

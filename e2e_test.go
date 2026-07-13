@@ -1,4 +1,6 @@
-package e2e
+//go:build e2e
+
+package k8spodlogreceiver
 
 import (
 	"context"
@@ -12,8 +14,6 @@ import (
 	"go.opentelemetry.io/collector/component/componenttest"
 	"go.opentelemetry.io/collector/consumer/consumertest"
 	"go.opentelemetry.io/collector/receiver/receivertest"
-
-	k8sapilog "github.com/eugenekurasov/security-observability-stack/otel-components/k8sapilogreceiver"
 )
 
 // kubeconfig returns the kubeconfig path from KUBECONFIG env or ~/.kube/config,
@@ -27,7 +27,7 @@ func kubeconfig(t *testing.T) string {
 	require.NoError(t, err)
 	kp := filepath.Join(home, ".kube", "config")
 	if _, err := os.Stat(kp); err != nil {
-		t.Skipf("no kubeconfig at %s — set KUBECONFIG to run integration tests", kp)
+		t.Skipf("no kubeconfig at %s — set KUBECONFIG to run e2e tests", kp)
 	}
 	return kp
 }
@@ -36,9 +36,9 @@ func kubeconfig(t *testing.T) string {
 // It skips the test (rather than failing) if the cluster is unreachable,
 // so CI without a cluster stays green.
 // Returns the log sink and a shutdown function the caller must defer.
-func startReceiver(t *testing.T, cfg *k8sapilog.Config) (*consumertest.LogsSink, func()) {
+func startReceiver(t *testing.T, cfg *Config) (*consumertest.LogsSink, func()) {
 	t.Helper()
-	factory := k8sapilog.NewFactory()
+	factory := NewFactory()
 	sink := &consumertest.LogsSink{}
 	recv, err := factory.CreateLogs(
 		context.Background(),
@@ -49,26 +49,26 @@ func startReceiver(t *testing.T, cfg *k8sapilog.Config) (*consumertest.LogsSink,
 	require.NoError(t, err)
 
 	if err := recv.Start(context.Background(), componenttest.NewNopHost()); err != nil {
-		t.Skipf("cluster unreachable, skipping integration test: %v", err)
+		t.Skipf("cluster unreachable, skipping e2e test: %v", err)
 	}
 	return sink, func() {
 		assert.NoError(t, recv.Shutdown(context.Background()))
 	}
 }
 
-func baseConfig(t *testing.T) *k8sapilog.Config {
+func baseConfig(t *testing.T) *Config {
 	t.Helper()
-	factory := k8sapilog.NewFactory()
-	cfg := factory.CreateDefaultConfig().(*k8sapilog.Config)
+	factory := NewFactory()
+	cfg := factory.CreateDefaultConfig().(*Config)
 	cfg.APIConfig.InCluster = false
 	cfg.APIConfig.KubeconfigPath = kubeconfig(t)
 	cfg.SinceSeconds = 300
 	return cfg
 }
 
-// TestIntegration_ReceivesLogs verifies end-to-end: the receiver connects,
+// TestE2E_ReceivesLogs verifies end-to-end: the receiver connects,
 // discovers pods, and emits log records with the three required resource attributes.
-func TestIntegration_ReceivesLogs(t *testing.T) {
+func TestE2E_ReceivesLogs(t *testing.T) {
 	sink, shutdown := startReceiver(t, baseConfig(t))
 	defer shutdown()
 
@@ -82,9 +82,9 @@ func TestIntegration_ReceivesLogs(t *testing.T) {
 	assert.NotEmpty(t, attrs["k8s.container.name"])
 }
 
-// TestIntegration_NamespaceFilter verifies that setting Namespaces restricts
+// TestE2E_NamespaceFilter verifies that setting Namespaces restricts
 // log collection to only the specified namespace.
-func TestIntegration_NamespaceFilter(t *testing.T) {
+func TestE2E_NamespaceFilter(t *testing.T) {
 	cfg := baseConfig(t)
 	cfg.Namespaces = []string{"kube-system"}
 
@@ -103,9 +103,9 @@ func TestIntegration_NamespaceFilter(t *testing.T) {
 	}
 }
 
-// TestIntegration_Shutdown verifies that Shutdown cancels all active streams
+// TestE2E_Shutdown verifies that Shutdown cancels all active streams
 // and returns without hanging.
-func TestIntegration_Shutdown(t *testing.T) {
+func TestE2E_Shutdown(t *testing.T) {
 	sink, shutdown := startReceiver(t, baseConfig(t))
 
 	// Wait for at least one stream to become active before shutting down.

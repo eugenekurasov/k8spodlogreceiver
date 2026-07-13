@@ -1,4 +1,4 @@
-package k8sapilogreceiver
+package k8spodlogreceiver
 
 import (
 	"context"
@@ -10,7 +10,7 @@ import (
 	"go.opentelemetry.io/collector/consumer/consumertest"
 	"go.opentelemetry.io/collector/receiver/receivertest"
 
-	"github.com/eugenekurasov/security-observability-stack/otel-components/k8sapilogreceiver/internal/metadata"
+	"github.com/eugenekurasov/security-observability-stack/otel-components/k8spodlogreceiver/internal/metadata"
 )
 
 func TestNewFactory_Type(t *testing.T) {
@@ -24,8 +24,6 @@ func TestCreateDefaultConfig_Defaults(t *testing.T) {
 
 	assert.True(t, cfg.APIConfig.InCluster)
 	assert.Equal(t, int64(300), cfg.SinceSeconds)
-	assert.InEpsilon(t, float32(5), cfg.RateLimit.QPS, 0.001)
-	assert.Equal(t, 10, cfg.RateLimit.Burst)
 	assert.Equal(t, 1*time.Second, cfg.ReconnectBackoff.InitialInterval)
 	assert.Equal(t, 30*time.Second, cfg.ReconnectBackoff.MaxInterval)
 	assert.Equal(t, 5*time.Minute, cfg.ReconnectBackoff.MaxElapsedTime)

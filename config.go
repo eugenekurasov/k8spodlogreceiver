@@ -1,17 +1,18 @@
-// Package k8sapilogreceiver implements an OpenTelemetry Collector receiver
+// Package k8spodlogreceiver implements an OpenTelemetry Collector receiver
 // that streams Kubernetes pod logs via the Kubernetes API server
 // (kubectl logs-style), avoiding the need for hostPath mounts or
 // DaemonSet node-level filesystem access.
-package k8sapilogreceiver
+package k8spodlogreceiver
 
 import (
 	"errors"
 	"time"
 
 	"go.opentelemetry.io/collector/component"
+	"go.opentelemetry.io/collector/filter"
 )
 
-// Config defines the user-facing configuration for the k8sapilog receiver.
+// Config defines the user-facing configuration for the k8spodlog receiver.
 type Config struct {
 	// APIConfig controls how the receiver talks to the Kubernetes API
 	// server: in-cluster (default) or an explicit kubeconfig path for
@@ -21,6 +22,10 @@ type Config struct {
 	// Namespaces restricts log collection to specific namespaces.
 	// Empty means "all namespaces visible to the ServiceAccount's RBAC".
 	Namespaces []string `mapstructure:"namespaces"`
+
+	// Filtered namespace for log collection,
+	// Can be helfpull if needed excluded couple namespace instead
+	ExcludeNamespaces []filter.Config `mapstructure:"exclude_namespaces"`
 
 	// PodLabelSelector filters which pods are watched, e.g.
 	// "app.kubernetes.io/part-of=payments".
@@ -36,10 +41,6 @@ type Config struct {
 	// stream from the kubelet is interrupted (rotation, pod restart,
 	// transient API server errors).
 	ReconnectBackoff ReconnectBackoffConfig `mapstructure:"reconnect_backoff"`
-
-	// RateLimit protects the API server from being overwhelmed when
-	// watching a large number of pods concurrently.
-	RateLimit RateLimitConfig `mapstructure:"rate_limit"`
 }
 
 // APIConfig controls how the receiver authenticates to the API server.
@@ -60,15 +61,9 @@ type ReconnectBackoffConfig struct {
 	MaxElapsedTime  time.Duration `mapstructure:"max_elapsed_time"`
 }
 
-// RateLimitConfig throttles requests to the Kubernetes API server.
-type RateLimitConfig struct {
-	QPS   float32 `mapstructure:"qps"`
-	Burst int     `mapstructure:"burst"`
-}
-
 var (
 	errNoRBACHint = errors.New(
-		"k8sapilogreceiver: ensure the ServiceAccount has RBAC permission " +
+		"k8spodlogreceiver: ensure the ServiceAccount has RBAC permission " +
 			"for resources: [\"pods\", \"pods/log\"], verbs: [\"get\", \"list\", \"watch\"]",
 	)
 )
@@ -76,11 +71,8 @@ var (
 // Validate checks the receiver configuration for obvious misconfigurations
 // before the collector starts.
 func (cfg *Config) Validate() error {
-	if cfg.RateLimit.QPS <= 0 {
-		return errors.New("k8sapilogreceiver: rate_limit.qps must be > 0")
-	}
 	if cfg.SinceSeconds < 0 {
-		return errors.New("k8sapilogreceiver: since_seconds must be >= 0")
+		return errors.New("k8spodlogreceiver: since_seconds must be >= 0")
 	}
 	return nil
 }

@@ -3,6 +3,7 @@ package k8spodlogreceiver
 import (
 	"context"
 	"fmt"
+	"net/http"
 	"sync"
 
 	"go.opentelemetry.io/collector/component"
@@ -22,6 +23,13 @@ type logsReceiver struct {
 	// kubernetes.Interface instead of *kubernetes.Clientset so tests can
 	// inject fake.NewSimpleClientset() without a real API server.
 	clientset kubernetes.Interface
+
+	// httpClient is the transport backing clientset. Kept so Shutdown can
+	// force its idle keep-alive connections closed — cancelling the
+	// informer/stream context only aborts in-flight requests, it doesn't
+	// close already-established connections sitting in the transport's
+	// pool, which otherwise leak as goroutines blocked in IO wait.
+	httpClient *http.Client
 
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
@@ -53,7 +61,13 @@ func (r *logsReceiver) Start(_ context.Context, _ component.Host) error {
 		return fmt.Errorf("k8spodlogreceiver: building kube client config: %w", err)
 	}
 
-	clientset, err := kubernetes.NewForConfig(restCfg)
+	httpClient, err := rest.HTTPClientFor(restCfg)
+	if err != nil {
+		return fmt.Errorf("k8spodlogreceiver: building kube HTTP client: %w", err)
+	}
+	r.httpClient = httpClient
+
+	clientset, err := kubernetes.NewForConfigAndClient(restCfg, httpClient)
 	if err != nil {
 		return fmt.Errorf("k8spodlogreceiver: %w (%v)", errNoRBACHint, err)
 	}
@@ -73,6 +87,9 @@ func (r *logsReceiver) Shutdown(_ context.Context) error {
 		r.cancel()
 	}
 	r.wg.Wait()
+	if r.httpClient != nil {
+		r.httpClient.CloseIdleConnections()
+	}
 	return nil
 }
 

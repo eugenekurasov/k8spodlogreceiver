@@ -242,6 +242,12 @@ and retry.
   per line with no stack-trace/multiline joining. Would need a
   stanza-based parsing operator pipeline, similar to `filelogreceiver`,
   layered on top.
+- **Replicas > 1 is unsafe**: `activeStreams` tracking is in-process only,
+  with no coordination across replicas. Running more than one collector
+  replica means every replica independently discovers and streams the
+  same pods, producing duplicate log records. HA requires distributed
+  stream ownership (e.g. consistent-hash ring + lease coordination) —
+  not yet implemented.
 - Not yet submitted upstream. Intent is to prototype, test against a
   real cluster, and open a discussion on #23339 proposing this as an
   additional collection mode rather than a replacement.

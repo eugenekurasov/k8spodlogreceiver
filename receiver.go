@@ -9,10 +9,13 @@ import (
 	"go.opentelemetry.io/collector/component"
 	"go.opentelemetry.io/collector/consumer"
 	"go.opentelemetry.io/collector/receiver"
+	"go.opentelemetry.io/collector/receiver/receiverhelper"
 
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
+
+	"github.com/eugenekurasov/security-observability-stack/otel-components/k8spodlogreceiver/internal/metadata"
 )
 
 type logsReceiver struct {
@@ -42,14 +45,39 @@ type logsReceiver struct {
 	// startStream is called for each newly discovered container. It is a
 	// field so tests can substitute a no-op without a real API server.
 	startStream func(ctx context.Context, namespace, podName, containerName, key string)
+
+	// obsrep records the standard otelcol_receiver_accepted_log_records /
+	// otelcol_receiver_refused_log_records metrics.
+	obsrep *receiverhelper.ObsReport
+
+	// telemetry records this receiver's component-specific metrics
+	// (active_streams, stream_reconnects_total, stream_errors_total,
+	// informer_events_total).
+	telemetry *metadata.TelemetryBuilder
 }
 
 func newLogsReceiver(settings receiver.Settings, cfg *Config, c consumer.Logs) (receiver.Logs, error) {
+	obsrep, err := receiverhelper.NewObsReport(receiverhelper.ObsReportSettings{
+		ReceiverID:             settings.ID,
+		Transport:              "http",
+		ReceiverCreateSettings: settings,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("k8spodlogreceiver: building obsreport: %w", err)
+	}
+
+	telemetryBuilder, err := metadata.NewTelemetryBuilder(settings.TelemetrySettings)
+	if err != nil {
+		return nil, fmt.Errorf("k8spodlogreceiver: building telemetry: %w", err)
+	}
+
 	r := &logsReceiver{
 		cfg:          cfg,
 		settings:     settings,
 		consumer:     c,
 		activeStreams: make(map[string]context.CancelFunc),
+		obsrep:        obsrep,
+		telemetry:     telemetryBuilder,
 	}
 	r.startStream = r.streamContainerLogs
 	return r, nil

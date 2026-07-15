@@ -7,9 +7,12 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.opentelemetry.io/collector/receiver/receivertest"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+
+	"github.com/eugenekurasov/security-observability-stack/otel-components/k8spodlogreceiver/internal/metadata"
 )
 
 // newTestReceiver creates a minimal logsReceiver for unit tests.
@@ -124,4 +127,37 @@ func TestOnPodDeleted_MultiContainer(t *testing.T) {
 
 	assert.True(t, cancelledA, "container-a stream must be cancelled")
 	assert.True(t, cancelledB, "container-b stream must be cancelled")
+}
+
+// TestOnPodAddedDeleted_RecordsActiveStreamsWithRealTelemetry verifies the
+// active_streams/informer_events_total recording path doesn't panic and
+// reflects the right count when a real (non-nil) TelemetryBuilder is wired
+// in — the other tests above deliberately leave telemetry nil to exercise
+// the nil-guard path instead.
+func TestOnPodAddedDeleted_RecordsActiveStreamsWithRealTelemetry(t *testing.T) {
+	tb, err := metadata.NewTelemetryBuilder(receivertest.NewNopSettings(metadata.Type).TelemetrySettings)
+	require.NoError(t, err)
+
+	r := newTestReceiver()
+	r.telemetry = tb
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	require.NotPanics(t, func() {
+		r.onPodAdded(ctx, makePod("payments", "app-abc", "api", "sidecar"))
+	})
+	r.mu.Lock()
+	assert.Len(t, r.activeStreams, 2)
+	r.mu.Unlock()
+
+	require.NotPanics(t, func() {
+		r.onPodDeleted(makePod("payments", "app-abc", "api", "sidecar"))
+	})
+	r.mu.Lock()
+	assert.Empty(t, r.activeStreams)
+	r.mu.Unlock()
+
+	cancel()
+	r.wg.Wait()
 }

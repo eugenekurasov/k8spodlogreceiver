@@ -6,6 +6,8 @@ github.com/davecgh/go-spew v1.1.1 h1:vj9j/u1bqnvCEfJOwUhtlOARqs3+rkHYY13jYWTU97c
 github.com/davecgh/go-spew v1.1.1/go.mod h1:J7Y8YcW2NihsgmVo/mv3lAwl/skON4iLHjSsI+c5H38=
 github.com/emicklei/go-restful/v3 v3.11.0 h1:rAQeMHw1c7zTmncogyy8VvRZwtkmkZ4FxERmMY4rD+g=
 github.com/emicklei/go-restful/v3 v3.11.0/go.mod h1:6n3XBCmQQb25CM2LCACGz8ukIrRry+4bhvbpWn3mrbc=
+github.com/evanphx/json-patch v4.12.0+incompatible h1:4onqiflcdA9EOZ4RxV643DvftH5pOlLGNtQ5lPWQu84=
+github.com/evanphx/json-patch v4.12.0+incompatible/go.mod h1:50XU6AFN0ol/bzJsmQLiYLvXMP4fmwYFNcr97nuDLSk=
 github.com/go-logr/logr v1.2.2/go.mod h1:jdQByPbusPIv2/zmleS9BjJVeZ6kBagPoEUsqbVz/1A=
 github.com/go-logr/logr v1.4.3 h1:CjnDlHq8ikf6E492q6eKboGOC0T8CDaOvkHCIg8idEI=
 github.com/go-logr/logr v1.4.3/go.mod h1:9T104GzyrTigFIr8wt5mBrctHMim0Nb2HLGrmQ40KvY=
@@ -80,6 +82,8 @@ github.com/onsi/ginkgo/v2 v2.15.0 h1:79HwNRBAZHOEwrczrgSOPy+eFTTlIGELKy5as+ClttY
 github.com/onsi/ginkgo/v2 v2.15.0/go.mod h1:HlxMHtYF57y6Dpf+mc5529KKmSq9h2FpCF+/ZkwUxKM=
 github.com/onsi/gomega v1.31.0 h1:54UJxxj6cPInHS3a35wm6BK/F9nHYueZ1NVujHDrnXE=
 github.com/onsi/gomega v1.31.0/go.mod h1:DW9aCi7U6Yi40wNVAvT6kzFnEVEI5n3DloYBiKiT6zk=
+github.com/pkg/errors v0.9.1 h1:FEBLx1zS214owpjy7qsBeixbURkuhQAwrK5UwLGTwt4=
+github.com/pkg/errors v0.9.1/go.mod h1:bwawxfHBFNV+L2hUp1rHADufV3IMtnDRdf1r5NINEl0=
 github.com/pmezard/go-difflib v1.0.0 h1:4DBwDE0NGyQoBHbLQYPwSUPoCMWR5BEzIk/f1lZbAQM=
 github.com/pmezard/go-difflib v1.0.0/go.mod h1:iKH77koFhYxTK1pcRnkKkqfTogsbg7gZNVY4sRDYZ/4=
 github.com/rogpeppe/go-internal v1.14.1 h1:UQB4HGPB6osV0SQTLymcB4TgvyWu6ZyliaW0tI/otEQ=
@@ -113,6 +117,10 @@ go.opentelemetry.io/collector/consumer/consumertest v0.156.0 h1:hQcocbgZHL/ebRjO
 go.opentelemetry.io/collector/consumer/consumertest v0.156.0/go.mod h1:R/OttdDWuo4Hz80AFBop6VA79Rd/Pk9HROUWySSwiGc=
 go.opentelemetry.io/collector/consumer/xconsumer v0.156.0 h1:XRkLqtyWnc1CVzAFdMDfmozKhrrqe/WW0ldzNALce7U=
 go.opentelemetry.io/collector/consumer/xconsumer v0.156.0/go.mod h1:noYZwt6zId25ebyGRJfWSs4TfFV8RkUJeNyCoE0YaEU=
+go.opentelemetry.io/collector/extension v1.62.0 h1:otGURB9mCfpmRrBr+aI2NS/RjwZr2TZ4Crbqi1N3D7w=
+go.opentelemetry.io/collector/extension v1.62.0/go.mod h1:EmaC0bqQ6cc4cEkiR29r04UZWQLVT7KLJTfzfycLEEQ=
+go.opentelemetry.io/collector/extension/xextension v0.156.0 h1:DKjVhlLEvFpEd1C/FSJt9jYmWkDAhFe7ypbUZcAg//U=
+go.opentelemetry.io/collector/extension/xextension v0.156.0/go.mod h1:dq8AbQJvnIlInXTZBPmlk7mQuqrN/K35V3RnomyOazk=
 go.opentelemetry.io/collector/featuregate v1.62.0 h1:pYY7RlulSCTOS9mFWxasMLwYJCfNXHtnOkZlv3jg/V4=
 go.opentelemetry.io/collector/featuregate v1.62.0/go.mod h1:4ga1QBMPEejXXmpyJS8lmaRpknJ3Lb9Bvk6e420bUFU=
 go.opentelemetry.io/collector/filter v0.156.0 h1:Hwhr2/qsNd78F0NJnm9J/8a7Advyovxdd77I4pC+LhM=
@@ -129,8 +137,12 @@ go.opentelemetry.io/collector/pdata/testdata v0.156.0 h1:0+0YZYap+zHwx4c3TrgvWGb
 go.opentelemetry.io/collector/pdata/testdata v0.156.0/go.mod h1:7amnd10hSandpk/VHGBJ9vMR59PnKh2ngwbtFLKezi4=
 go.opentelemetry.io/collector/pipeline v1.62.0 h1:+fFaLegFsMPhBl6oHauS09qOoKWgtufjM3g9i/wXZ44=
 go.opentelemetry.io/collector/pipeline v1.62.0/go.mod h1:RD90NG3Jbk965Xaqym3JyHkuol4uZJjQVUkD9ddXJIs=
+go.opentelemetry.io/collector/pipeline/xpipeline v0.156.0 h1:j62f0ILpqzwzSJQ8cJygJCnthSHyqN47uomk14IXmaA=
+go.opentelemetry.io/collector/pipeline/xpipeline v0.156.0/go.mod h1:ymWYILTf6bO5qrEKD1EyIl7g30AaENPZfS3OFCb5IRA=
 go.opentelemetry.io/collector/receiver v1.62.0 h1:hBjVSZTLrY5IXgcI8SQyDE2D/15vivQrIiaIvi8Yri0=
 go.opentelemetry.io/collector/receiver v1.62.0/go.mod h1:Sao2WTwFxmX563Q/CIEXzU6cql+rCQ1NCwG2IALtBrg=
+go.opentelemetry.io/collector/receiver/receiverhelper v0.156.0 h1:vEQH6AqV5u32N3vzSDVlNlMfI1IILjUE/O/zzaPC/rM=
+go.opentelemetry.io/collector/receiver/receiverhelper v0.156.0/go.mod h1:9QUtBTOf7sVnGHL0S//GnGe/Qemd306CWd6Vq7HK1g0=
 go.opentelemetry.io/collector/receiver/receivertest v0.156.0 h1:7Z+8tXDZv11Qfaf/DmWxaCpUAdjWrwRtd9xttMjNZko=
 go.opentelemetry.io/collector/receiver/receivertest v0.156.0/go.mod h1:qRWqCgqOSglqCaMqlmAiryXtWOktPbHjm8VQggbUgq8=
 go.opentelemetry.io/collector/receiver/xreceiver v0.156.0 h1:f8YN4oLLoXa1pNyrSDu316JOEUkG4bhtYQMuU08Xyf0=

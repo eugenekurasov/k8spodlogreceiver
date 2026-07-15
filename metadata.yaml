@@ -19,3 +19,52 @@ tests:
       kubeconfig_path: testdata/kubeconfig-nontls.yaml
     namespaces: []
     pod_label_selector: ""
+
+# otelcol_receiver_accepted_log_records / otelcol_receiver_refused_log_records
+# are not declared here — they come from the standard receiverhelper.ObsReport
+# wiring in receiver.go, not from component-specific telemetry.
+telemetry:
+  attributes:
+    reason:
+      description: Why a log stream connection attempt failed.
+      type: string
+      enum: [rbac_denied, pod_gone, other]
+    event_type:
+      description: The kind of pod event observed by the discovery informer.
+      type: string
+      enum: [added, deleted]
+  metrics:
+    active_streams:
+      enabled: true
+      description: Number of pod/container log streams currently being tailed
+      stability: development
+      unit: "1"
+      gauge:
+        value_type: int
+    stream_reconnects_total:
+      enabled: true
+      description: Number of times a pod/container log stream was re-established after the initial connection
+      stability: development
+      unit: "1"
+      sum:
+        value_type: int
+        monotonic: true
+    stream_errors_total:
+      enabled: true
+      description: Number of log stream connection errors, by reason
+      stability: development
+      unit: "1"
+      sum:
+        value_type: int
+        monotonic: true
+      attributes: [reason]
+    informer_events_total:
+      enabled: true
+      optional: true
+      description: Number of pod add/delete events observed by the discovery informer (debug)
+      stability: development
+      unit: "1"
+      sum:
+        value_type: int
+        monotonic: true
+      attributes: [event_type]

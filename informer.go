@@ -4,10 +4,15 @@ import (
 	"context"
 	"time"
 
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/metric"
+
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/tools/cache"
+
+	"github.com/eugenekurasov/security-observability-stack/otel-components/k8spodlogreceiver/internal/metadata"
 )
 
 func (r *logsReceiver) runPodInformer(ctx context.Context) {
@@ -56,6 +61,10 @@ func (r *logsReceiver) runPodInformer(ctx context.Context) {
 }
 
 func (r *logsReceiver) onPodAdded(ctx context.Context, pod *corev1.Pod) {
+	if r.telemetry != nil {
+		r.telemetry.InformerEventsTotal.Add(ctx, 1, metric.WithAttributes(attribute.String("event_type", metadata.EventTypeAdded)))
+	}
+
 	for _, container := range pod.Spec.Containers {
 		key := pod.Namespace + "/" + pod.Name + "/" + container.Name
 
@@ -71,11 +80,17 @@ func (r *logsReceiver) onPodAdded(ctx context.Context, pod *corev1.Pod) {
 		r.wg.Add(1)
 		go r.startStream(streamCtx, pod.Namespace, pod.Name, container.Name, key)
 	}
+
+	r.recordActiveStreams(ctx)
 }
 
 func (r *logsReceiver) onPodDeleted(pod *corev1.Pod) {
+	ctx := context.Background()
+	if r.telemetry != nil {
+		r.telemetry.InformerEventsTotal.Add(ctx, 1, metric.WithAttributes(attribute.String("event_type", metadata.EventTypeDeleted)))
+	}
+
 	r.mu.Lock()
-	defer r.mu.Unlock()
 	for _, container := range pod.Spec.Containers {
 		key := pod.Namespace + "/" + pod.Name + "/" + container.Name
 		if cancel, ok := r.activeStreams[key]; ok {
@@ -83,4 +98,19 @@ func (r *logsReceiver) onPodDeleted(pod *corev1.Pod) {
 			delete(r.activeStreams, key)
 		}
 	}
+	r.mu.Unlock()
+
+	r.recordActiveStreams(ctx)
+}
+
+// recordActiveStreams reports the current number of tailed pod/container
+// log streams to the active_streams gauge.
+func (r *logsReceiver) recordActiveStreams(ctx context.Context) {
+	if r.telemetry == nil {
+		return
+	}
+	r.mu.Lock()
+	count := int64(len(r.activeStreams))
+	r.mu.Unlock()
+	r.telemetry.ActiveStreams.Record(ctx, count)
 }

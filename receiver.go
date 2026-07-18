@@ -13,8 +13,8 @@ import (
 
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
-	"k8s.io/client-go/tools/clientcmd"
 
+	"github.com/eugenekurasov/security-observability-stack/otel-components/k8spodlogreceiver/internal/k8sconfig"
 	"github.com/eugenekurasov/security-observability-stack/otel-components/k8spodlogreceiver/internal/metadata"
 )
 
@@ -122,25 +122,5 @@ func (r *logsReceiver) Shutdown(_ context.Context) error {
 }
 
 func (r *logsReceiver) buildRESTConfig() (*rest.Config, error) {
-	var cfg *rest.Config
-	var err error
-
-	switch {
-	case r.cfg.APIConfig.InCluster:
-		cfg, err = rest.InClusterConfig()
-	case r.cfg.APIConfig.KubeconfigPath != "":
-		cfg, err = clientcmd.BuildConfigFromFlags("", r.cfg.APIConfig.KubeconfigPath)
-	default:
-		// No explicit path: honour KUBECONFIG env then fall back to ~/.kube/config,
-		// matching the behaviour of kubectl and client-go's standard tooling.
-		cfg, err = clientcmd.NewNonInteractiveDeferredLoadingClientConfig(
-			clientcmd.NewDefaultClientConfigLoadingRules(),
-			nil,
-		).ClientConfig()
-	}
-	if err != nil {
-		return nil, err
-	}
-
-	return cfg, nil
+	return k8sconfig.CreateRestConfig(r.cfg.APIConfig)
 }

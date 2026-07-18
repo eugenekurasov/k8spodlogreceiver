@@ -60,7 +60,7 @@ func baseConfig(t *testing.T) *Config {
 	t.Helper()
 	factory := NewFactory()
 	cfg := factory.CreateDefaultConfig().(*Config)
-	cfg.APIConfig.InCluster = false
+	cfg.APIConfig.AuthType = AuthTypeKubeConfig
 	cfg.APIConfig.KubeconfigPath = kubeconfig(t)
 	sinceSeconds := int64(300)
 	cfg.SinceSeconds = &sinceSeconds

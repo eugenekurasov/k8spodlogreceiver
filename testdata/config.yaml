@@ -4,7 +4,9 @@ receivers:
     pod_label_selector: app.kubernetes.io/part-of=payments
     since_seconds: 300
     api_config:
-      in_cluster: true
+      auth_type: serviceAccount
+      kube_api_qps: 20
+      kube_api_burst: 40
     reconnect_backoff:
       initial_interval: 1s
       max_interval: 30s

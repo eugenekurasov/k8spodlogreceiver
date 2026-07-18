@@ -15,7 +15,7 @@ status:
 tests:
   config:
     api_config:
-      in_cluster: false
+      auth_type: kubeConfig
       kubeconfig_path: testdata/kubeconfig-nontls.yaml
     namespaces: []
     pod_label_selector: ""

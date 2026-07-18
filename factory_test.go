@@ -22,7 +22,7 @@ func TestNewFactory_Type(t *testing.T) {
 func TestCreateDefaultConfig_Defaults(t *testing.T) {
 	cfg := createDefaultConfig().(*Config)
 
-	assert.True(t, cfg.APIConfig.InCluster)
+	assert.Equal(t, AuthTypeServiceAccount, cfg.APIConfig.AuthType)
 	assert.Nil(t, cfg.SinceSeconds)
 	assert.Equal(t, 1*time.Second, cfg.ReconnectBackoff.InitialInterval)
 	assert.Equal(t, 30*time.Second, cfg.ReconnectBackoff.MaxInterval)

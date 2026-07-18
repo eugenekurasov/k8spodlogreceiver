@@ -10,13 +10,15 @@ import (
 
 	"go.opentelemetry.io/collector/component"
 	"go.opentelemetry.io/collector/filter"
+
+	"github.com/eugenekurasov/security-observability-stack/otel-components/k8spodlogreceiver/internal/k8sconfig"
 )
 
 // Config defines the user-facing configuration for the k8spodlog receiver.
 type Config struct {
-	// APIConfig controls how the receiver talks to the Kubernetes API
-	// server: in-cluster (default) or an explicit kubeconfig path for
-	// local development/testing.
+	// APIConfig controls how the receiver authenticates to the Kubernetes
+	// API server: ServiceAccount (default, in-cluster) or an explicit
+	// kubeconfig for local development/testing.
 	APIConfig APIConfig `mapstructure:"api_config"`
 
 	// Namespaces restricts log collection to specific namespaces.
@@ -50,14 +52,30 @@ type Config struct {
 }
 
 // APIConfig controls how the receiver authenticates to the API server.
-type APIConfig struct {
-	// InCluster uses the pod's mounted ServiceAccount token (standard
-	// production mode). Default: true.
-	InCluster bool `mapstructure:"in_cluster"`
+// Alias (not a new type) for k8sconfig.APIConfig, whose fields carry the
+// mapstructure tags that make up this section's user-facing schema — see
+// internal/k8sconfig for the field docs and where this is applied.
+type APIConfig = k8sconfig.APIConfig
 
-	// KubeconfigPath is used only when InCluster is false (local dev).
-	KubeconfigPath string `mapstructure:"kubeconfig_path"`
-}
+// AuthType and its values are aliased from internal/k8sconfig so callers in
+// this package (factory defaults, tests) don't need to import it directly.
+type AuthType = k8sconfig.AuthType
+
+const (
+	AuthTypeNone           = k8sconfig.AuthTypeNone
+	AuthTypeServiceAccount = k8sconfig.AuthTypeServiceAccount
+	AuthTypeKubeConfig     = k8sconfig.AuthTypeKubeConfig
+)
+
+// DefaultKubeAPIQPS is client-go's own built-in default queries-per-second
+// limit, documented here for operators tuning KubeAPIQPS. See
+// internal/k8sconfig for where this is actually applied.
+const DefaultKubeAPIQPS = k8sconfig.DefaultKubeAPIQPS
+
+// DefaultKubeAPIBurst is client-go's own built-in default burst limit,
+// documented here for operators tuning KubeAPIBurst. See internal/k8sconfig
+// for where this is actually applied.
+const DefaultKubeAPIBurst = k8sconfig.DefaultKubeAPIBurst
 
 // ReconnectBackoffConfig configures exponential backoff for stream
 // reconnection.
@@ -80,7 +98,7 @@ func (cfg *Config) Validate() error {
 	if cfg.SinceSeconds != nil && *cfg.SinceSeconds < 0 {
 		return errors.New("k8spodlogreceiver: since_seconds must be >= 0")
 	}
-	return nil
+	return cfg.APIConfig.Validate()
 }
 
 var _ component.Config = (*Config)(nil)

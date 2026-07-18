@@ -190,7 +190,7 @@ func (r *logsReceiver) emitLogLine(namespace, podName, containerName, line strin
 	}
 	err := r.consumer.ConsumeLogs(consumeCtx, logs)
 	if r.obsrep != nil {
-		r.obsrep.EndLogsOp(consumeCtx, "k8s_pod_log", 1, err)
+		r.obsrep.EndLogsOp(consumeCtx, "k8s_podlog", 1, err)
 	}
 	if err != nil {
 		r.settings.Logger.Error("failed to forward log record to pipeline", zap.Error(err))

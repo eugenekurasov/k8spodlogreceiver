@@ -26,7 +26,7 @@ func NewFactory() receiver.Factory {
 func createDefaultConfig() component.Config {
 	return &Config{
 		APIConfig: APIConfig{
-			InCluster: true,
+			AuthType: AuthTypeServiceAccount,
 		},
 		SinceSeconds: nil, // full available history by default; set explicitly to bound it
 		ReconnectBackoff: ReconnectBackoffConfig{

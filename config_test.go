@@ -13,6 +13,7 @@ import (
 
 func TestConfigValidate_Valid(t *testing.T) {
 	cfg := &Config{
+		APIConfig:    APIConfig{AuthType: AuthTypeServiceAccount},
 		SinceSeconds: nil,
 	}
 	assert.NoError(t, componenttest.CheckConfigStruct(cfg))
@@ -22,6 +23,7 @@ func TestConfigValidate_Valid(t *testing.T) {
 func TestConfigValidate_NegativeSinceSeconds(t *testing.T) {
 	negative := int64(-1)
 	cfg := &Config{
+		APIConfig:    APIConfig{AuthType: AuthTypeServiceAccount},
 		SinceSeconds: &negative,
 	}
 	assert.Error(t, cfg.Validate())
@@ -30,6 +32,7 @@ func TestConfigValidate_NegativeSinceSeconds(t *testing.T) {
 func TestConfigValidate_ZeroSinceSeconds(t *testing.T) {
 	zero := int64(0)
 	cfg := &Config{
+		APIConfig:    APIConfig{AuthType: AuthTypeServiceAccount},
 		SinceSeconds: &zero,
 	}
 	assert.NoError(t, cfg.Validate())
@@ -37,8 +40,30 @@ func TestConfigValidate_ZeroSinceSeconds(t *testing.T) {
 
 func TestConfigValidate_NilSinceSeconds(t *testing.T) {
 	cfg := &Config{
+		APIConfig:    APIConfig{AuthType: AuthTypeServiceAccount},
 		SinceSeconds: nil,
 	}
+	assert.NoError(t, cfg.Validate())
+}
+
+func TestConfigValidate_InvalidAuthType(t *testing.T) {
+	cfg := &Config{APIConfig: APIConfig{AuthType: "bogus"}}
+	assert.Error(t, cfg.Validate())
+}
+
+func TestConfigValidate_NegativeKubeAPIQPS(t *testing.T) {
+	cfg := &Config{APIConfig: APIConfig{AuthType: AuthTypeServiceAccount, KubeAPIQPS: -1}}
+	assert.Error(t, cfg.Validate())
+}
+
+func TestConfigValidate_NegativeKubeAPIBurst(t *testing.T) {
+	cfg := &Config{APIConfig: APIConfig{AuthType: AuthTypeServiceAccount, KubeAPIBurst: -1}}
+	assert.Error(t, cfg.Validate())
+}
+
+func TestConfigValidate_ZeroKubeAPIQPSAndBurst(t *testing.T) {
+	// Zero means "use client-go's own default", not "invalid".
+	cfg := &Config{APIConfig: APIConfig{AuthType: AuthTypeServiceAccount, KubeAPIQPS: 0, KubeAPIBurst: 0}}
 	assert.NoError(t, cfg.Validate())
 }
 
@@ -66,7 +91,9 @@ func TestLoadConfig_Testdata(t *testing.T) {
 	assert.Equal(t, "app.kubernetes.io/part-of=payments", cfg.PodLabelSelector)
 	require.NotNil(t, cfg.SinceSeconds)
 	assert.Equal(t, int64(300), *cfg.SinceSeconds)
-	assert.True(t, cfg.APIConfig.InCluster)
+	assert.Equal(t, AuthTypeServiceAccount, cfg.APIConfig.AuthType)
+	assert.Equal(t, float32(20), cfg.APIConfig.KubeAPIQPS)
+	assert.Equal(t, 40, cfg.APIConfig.KubeAPIBurst)
 	assert.Equal(t, 1*time.Second, cfg.ReconnectBackoff.InitialInterval)
 	assert.Equal(t, 30*time.Second, cfg.ReconnectBackoff.MaxInterval)
 	assert.Equal(t, 5*time.Minute, cfg.ReconnectBackoff.MaxElapsedTime)

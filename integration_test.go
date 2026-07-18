@@ -90,7 +90,7 @@ func TestIntegration_LogsArrive(t *testing.T) {
 	factory := NewFactory()
 	cfg := factory.CreateDefaultConfig().(*Config)
 	cfg.APIConfig = APIConfig{
-		InCluster: false, // uses default kubeconfig; kind sets it in CI
+		AuthType: AuthTypeKubeConfig, // uses default kubeconfig; kind sets it in CI
 	}
 	cfg.Namespaces = []string{integrationNamespace}
 	// SinceSeconds left nil (factory default): full available history, so the marker

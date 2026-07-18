@@ -115,7 +115,9 @@ different distribution.
 receivers:
   k8s_podlog:
     api_config:
-      in_cluster: true
+      auth_type: serviceAccount
+      kube_api_qps: 20
+      kube_api_burst: 40
     namespaces: ["payments", "billing"]
     exclude_namespaces:
       - regexp: "^kube-.*"
@@ -127,11 +129,30 @@ receivers:
       max_elapsed_time: 5m
 ```
 
-- `api_config.in_cluster` (default `true`): use the pod's mounted
-  ServiceAccount token. Set to `false` for local development, together with
-  `api_config.kubeconfig_path`.
+- `api_config.auth_type` (default `serviceAccount`): how to authenticate to
+  the API server.
+  - `serviceAccount`: use the pod's mounted ServiceAccount token (standard
+    production mode).
+  - `kubeConfig`: use `api_config.kubeconfig_path` if set, otherwise the
+    standard kubeconfig-loading chain (`KUBECONFIG` env, then
+    `~/.kube/config`) — use for local development.
+  - `none`: build the API host from `KUBERNETES_SERVICE_HOST` /
+    `KUBERNETES_SERVICE_PORT` with no client credentials, for an
+    unauthenticated proxy in front of the API server (e.g. `kubectl
+    proxy`). Not for production use.
 - `api_config.kubeconfig_path`: path to a kubeconfig file, used only when
-  `in_cluster` is `false`.
+  `auth_type` is `kubeConfig`.
+- `api_config.kube_api_qps` (default `0`, meaning client-go's own built-in
+  default of 5): maximum queries per second to the Kubernetes API. This
+  bounds the rate of *new* connection/reconnect attempts, not the number of
+  concurrently open log streams — `pods/log?follow=true` is a long-running
+  request exempt from the apiserver's inflight-request limits, so it isn't
+  what this setting protects against. Increase if you see "client-side
+  throttling" warnings in the collector logs, e.g. under heavy reconnect
+  churn across many pods.
+- `api_config.kube_api_burst` (default `0`, meaning client-go's own
+  built-in default of 10): maximum burst of requests to the Kubernetes API,
+  used alongside `kube_api_qps`.
 - `namespaces`: restrict log collection to these namespaces. Empty (default)
   means all namespaces visible to the ServiceAccount's RBAC.
 - `exclude_namespaces`: list of `strict` or `regexp` matchers

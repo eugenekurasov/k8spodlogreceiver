@@ -1,4 +1,6 @@
+display_name: Kubernetes Pod Logs Receiver
 type: k8s_podlog
+description: The Kubernetes Pod Logs Receiver collects logs from the Kubernetes API server.
 
 status:
   class: receiver
@@ -11,7 +13,6 @@ status:
 # Design goal: collect Kubernetes pod logs via the Kubernetes API server
 # (client-go CoreV1().Pods(ns).GetLogs()) instead of mounting the host
 # filesystem (hostPath) or requiring a DaemonSet with node-level access.
-
 tests:
   config:
     api_config:
@@ -20,36 +21,26 @@ tests:
     namespaces: []
     pod_label_selector: ""
 
-# otelcol_receiver_accepted_log_records / otelcol_receiver_refused_log_records
-# are not declared here — they come from the standard receiverhelper.ObsReport
-# wiring in receiver.go, not from component-specific telemetry.
+attributes:
+  event_type:
+    description: The kind of pod event observed by the discovery informer.
+    type: string
+    enum: [added, deleted]
+  reason:
+    description: Why a log stream connection attempt failed.
+    type: string
+    enum: [rbac_denied, pod_gone, other]
+
 telemetry:
-  attributes:
-    reason:
-      description: Why a log stream connection attempt failed.
-      type: string
-      enum: [rbac_denied, pod_gone, other]
-    event_type:
-      description: The kind of pod event observed by the discovery informer.
-      type: string
-      enum: [added, deleted]
   metrics:
-    active_streams:
+    active_log_streams:
       enabled: true
       description: Number of pod/container log streams currently being tailed
       stability: development
       unit: "1"
       gauge:
         value_type: int
-    stream_reconnects_total:
-      enabled: true
-      description: Number of times a pod/container log stream was re-established after the initial connection
-      stability: development
-      unit: "1"
-      sum:
-        value_type: int
-        monotonic: true
-    stream_errors_total:
+    log_connection_errors_total:
       enabled: true
       description: Number of log stream connection errors, by reason
       stability: development
@@ -58,7 +49,15 @@ telemetry:
         value_type: int
         monotonic: true
       attributes: [reason]
-    informer_events_total:
+    log_connection_reconnects_total:
+      enabled: true
+      description: Number of times a pod/container log stream was re-established after the initial connection
+      stability: development
+      unit: "1"
+      sum:
+        value_type: int
+        monotonic: true
+    pod_discovery_events_total:
       enabled: true
       optional: true
       description: Number of pod add/delete events observed by the discovery informer (debug)

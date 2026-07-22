@@ -9,7 +9,6 @@ import (
 	"time"
 
 	"go.opentelemetry.io/collector/component"
-	"go.opentelemetry.io/collector/filter"
 
 	"github.com/eugenekurasov/security-observability-stack/otel-components/k8spodlogreceiver/internal/k8sconfig"
 )
@@ -24,10 +23,6 @@ type Config struct {
 	// Namespaces restricts log collection to specific namespaces.
 	// Empty means "all namespaces visible to the ServiceAccount's RBAC".
 	Namespaces []string `mapstructure:"namespaces"`
-
-	// Filtered namespace for log collection,
-	// Can be helfpull if needed excluded couple namespace instead
-	ExcludeNamespaces []filter.Config `mapstructure:"exclude_namespaces"`
 
 	// PodLabelSelector filters which pods are watched, e.g.
 	// "app.kubernetes.io/part-of=payments".
@@ -49,7 +44,30 @@ type Config struct {
 	// stream from the kubelet is interrupted (rotation, pod restart,
 	// transient API server errors).
 	ReconnectBackoff ReconnectBackoffConfig `mapstructure:"reconnect_backoff"`
+
+	// MaxBatchSize is the maximum number of log records coalesced into a
+	// single plog.Logs / ConsumeLogs call per container stream. A container
+	// emitting at, say, 10k lines/sec would otherwise trigger 10k separate
+	// pipeline pushes per second; batching amortizes that per-line overhead.
+	// A partially-filled batch is still flushed after FlushInterval, so this
+	// bound never adds unbounded latency. Zero means "use the default"
+	// (defaultMaxBatchSize); negative is rejected by Validate.
+	MaxBatchSize int `mapstructure:"max_batch_size"`
+
+	// FlushInterval bounds how long a partially-filled batch waits before it
+	// is forwarded, so a low-volume stream isn't held back until it happens
+	// to accumulate MaxBatchSize lines. Zero means "use the default"
+	// (defaultFlushInterval); negative is rejected by Validate.
+	FlushInterval time.Duration `mapstructure:"flush_interval"`
 }
+
+const (
+	// defaultMaxBatchSize / defaultFlushInterval are the batching defaults
+	// applied by the factory and used as a fallback when a receiver is
+	// constructed without a fully-populated Config (e.g. in unit tests).
+	defaultMaxBatchSize  = 1000
+	defaultFlushInterval = 200 * time.Millisecond
+)
 
 // APIConfig controls how the receiver authenticates to the API server.
 // Alias (not a new type) for k8sconfig.APIConfig, whose fields carry the
@@ -97,6 +115,21 @@ var (
 func (cfg *Config) Validate() error {
 	if cfg.SinceSeconds != nil && *cfg.SinceSeconds < 0 {
 		return errors.New("k8spodlogreceiver: since_seconds must be >= 0")
+	}
+	if cfg.ReconnectBackoff.InitialInterval < 0 {
+		return errors.New("k8spodlogreceiver: reconnect_backoff.initial_interval must be >= 0")
+	}
+	if cfg.ReconnectBackoff.MaxInterval < 0 {
+		return errors.New("k8spodlogreceiver: reconnect_backoff.max_interval must be >= 0")
+	}
+	if cfg.ReconnectBackoff.MaxElapsedTime < 0 {
+		return errors.New("k8spodlogreceiver: reconnect_backoff.max_elapsed_time must be >= 0")
+	}
+	if cfg.MaxBatchSize < 0 {
+		return errors.New("k8spodlogreceiver: max_batch_size must be >= 0")
+	}
+	if cfg.FlushInterval < 0 {
+		return errors.New("k8spodlogreceiver: flush_interval must be >= 0")
 	}
 	return cfg.APIConfig.Validate()
 }

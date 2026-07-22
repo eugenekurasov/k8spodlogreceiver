@@ -11,10 +11,6 @@ import (
 	"github.com/eugenekurasov/security-observability-stack/otel-components/k8spodlogreceiver/internal/metadata"
 )
 
-// NewFactory creates a factory for the k8spodlog receiver, following the
-// standard OpenTelemetry Collector Contrib component conventions (see
-// receiver/filelogreceiver for a reference implementation of the same
-// pattern applied to a different transport).
 func NewFactory() receiver.Factory {
 	return receiver.NewFactory(
 		metadata.Type,
@@ -34,6 +30,8 @@ func createDefaultConfig() component.Config {
 			MaxInterval:     30 * time.Second,
 			MaxElapsedTime:  5 * time.Minute,
 		},
+		MaxBatchSize:  defaultMaxBatchSize,
+		FlushInterval: defaultFlushInterval,
 	}
 }
 

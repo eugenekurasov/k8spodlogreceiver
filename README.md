@@ -119,14 +119,14 @@ receivers:
       kube_api_qps: 20
       kube_api_burst: 40
     namespaces: ["payments", "billing"]
-    exclude_namespaces:
-      - regexp: "^kube-.*"
     pod_label_selector: "app.kubernetes.io/part-of=payments-platform"
     since_seconds: 300
     reconnect_backoff:
       initial_interval: 1s
       max_interval: 30s
       max_elapsed_time: 5m
+    max_batch_size: 1000
+    flush_interval: 200ms
 ```
 
 - `api_config.auth_type` (default `serviceAccount`): how to authenticate to
@@ -155,9 +155,6 @@ receivers:
   used alongside `kube_api_qps`.
 - `namespaces`: restrict log collection to these namespaces. Empty (default)
   means all namespaces visible to the ServiceAccount's RBAC.
-- `exclude_namespaces`: list of `strict` or `regexp` matchers
-  ([`go.opentelemetry.io/collector/filter`](https://pkg.go.dev/go.opentelemetry.io/collector/filter))
-  excluding namespaces that would otherwise be included.
 - `pod_label_selector`: only watch pods matching this label selector, e.g.
   `"app.kubernetes.io/part-of=payments"`.
 - `since_seconds`: how far back into existing logs to read when a
@@ -173,7 +170,27 @@ receivers:
   full available log history across every container on collector restart.
 - `reconnect_backoff.initial_interval` / `max_interval` / `max_elapsed_time`:
   exponential backoff applied when a log stream drops (pod restart, kubelet
-  log rotation, transient API server error) before reconnecting.
+  log rotation, transient API server error) before reconnecting. The delay
+  starts at `initial_interval`, doubles each failed attempt, and is capped at
+  `max_interval`. `max_elapsed_time` bounds the total time spent retrying a
+  single stream through an unbroken run of failures: once it is exceeded the
+  receiver gives up on that stream (a successful reconnect resets the clock).
+  Set `max_elapsed_time: 0` to retry indefinitely. Independently of backoff, a
+  stream is always stopped when the pod is deleted or reaches a terminal
+  (`Succeeded`/`Failed`) phase.
+- `max_batch_size` (default `1000`, `0` means use the default): the maximum
+  number of log lines coalesced into a single `plog.Logs` / `ConsumeLogs` push
+  per container stream. Each container's log stream is read independently and
+  its lines share the same resource attributes, so they are batched into one
+  payload instead of one push per line — at high line rates (e.g. 10k
+  lines/sec) this avoids allocating a `ResourceLogs` and invoking the pipeline
+  once per line. Larger values amortize per-push overhead further at the cost
+  of more memory held per in-flight batch.
+- `flush_interval` (default `200ms`, `0` means use the default): the maximum
+  time a partially-filled batch waits before being forwarded. This bounds the
+  latency a low-volume stream would otherwise incur waiting to accumulate
+  `max_batch_size` lines, so batching never trades throughput for unbounded
+  delivery delay.
 
 The full field definitions live in [`config.go`](./config.go), with a
 working sample in [`testdata/config.yaml`](./testdata/config.yaml).
@@ -194,7 +211,7 @@ go test -v ./...
 These run [`TestIntegration_LogsArrive`](./integration_test.go) against a
 real Kubernetes cluster — a pod is created that emits a marker log line,
 and the test asserts the receiver reads it back through the full
-informer → stream → consumer path.
+watch → stream → consumer path.
 
 **Prerequisites**
 

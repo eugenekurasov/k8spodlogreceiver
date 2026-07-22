@@ -16,8 +16,6 @@ import (
 	"go.opentelemetry.io/collector/receiver/receivertest"
 )
 
-// kubeconfig returns the kubeconfig path from KUBECONFIG env or ~/.kube/config,
-// and skips the test if the file does not exist.
 func kubeconfig(t *testing.T) string {
 	t.Helper()
 	if kp := os.Getenv("KUBECONFIG"); kp != "" {
@@ -32,10 +30,6 @@ func kubeconfig(t *testing.T) string {
 	return kp
 }
 
-// startReceiver creates and starts the receiver with the given config.
-// It skips the test (rather than failing) if the cluster is unreachable,
-// so CI without a cluster stays green.
-// Returns the log sink and a shutdown function the caller must defer.
 func startReceiver(t *testing.T, cfg *Config) (*consumertest.LogsSink, func()) {
 	t.Helper()
 	factory := NewFactory()
@@ -67,8 +61,6 @@ func baseConfig(t *testing.T) *Config {
 	return cfg
 }
 
-// TestE2E_ReceivesLogs verifies end-to-end: the receiver connects,
-// discovers pods, and emits log records with the three required resource attributes.
 func TestE2E_ReceivesLogs(t *testing.T) {
 	sink, shutdown := startReceiver(t, baseConfig(t))
 	defer shutdown()
@@ -83,8 +75,6 @@ func TestE2E_ReceivesLogs(t *testing.T) {
 	assert.NotEmpty(t, attrs["k8s.container.name"])
 }
 
-// TestE2E_NamespaceFilter verifies that setting Namespaces restricts
-// log collection to only the specified namespace.
 func TestE2E_NamespaceFilter(t *testing.T) {
 	cfg := baseConfig(t)
 	cfg.Namespaces = []string{"kube-system"}
@@ -104,8 +94,6 @@ func TestE2E_NamespaceFilter(t *testing.T) {
 	}
 }
 
-// TestE2E_Shutdown verifies that Shutdown cancels all active streams
-// and returns without hanging.
 func TestE2E_Shutdown(t *testing.T) {
 	sink, shutdown := startReceiver(t, baseConfig(t))
 

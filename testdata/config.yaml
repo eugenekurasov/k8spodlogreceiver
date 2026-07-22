@@ -11,6 +11,8 @@ receivers:
       initial_interval: 1s
       max_interval: 30s
       max_elapsed_time: 5m
+    max_batch_size: 500
+    flush_interval: 250ms
 
 processors:
   nop:

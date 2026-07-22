@@ -51,6 +51,34 @@ func TestConfigValidate_InvalidAuthType(t *testing.T) {
 	assert.Error(t, cfg.Validate())
 }
 
+func TestConfigValidate_NegativeReconnectBackoff(t *testing.T) {
+	tests := []struct {
+		name    string
+		backoff ReconnectBackoffConfig
+	}{
+		{"negative initial_interval", ReconnectBackoffConfig{InitialInterval: -1 * time.Second}},
+		{"negative max_interval", ReconnectBackoffConfig{MaxInterval: -1 * time.Second}},
+		{"negative max_elapsed_time", ReconnectBackoffConfig{MaxElapsedTime: -1 * time.Second}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := &Config{
+				APIConfig:        APIConfig{AuthType: AuthTypeServiceAccount},
+				ReconnectBackoff: tc.backoff,
+			}
+			assert.Error(t, cfg.Validate())
+		})
+	}
+}
+
+func TestConfigValidate_ZeroMaxElapsedTimeMeansInfinite(t *testing.T) {
+	cfg := &Config{
+		APIConfig:        APIConfig{AuthType: AuthTypeServiceAccount},
+		ReconnectBackoff: ReconnectBackoffConfig{MaxElapsedTime: 0},
+	}
+	assert.NoError(t, cfg.Validate(), "max_elapsed_time: 0 is valid (retry indefinitely)")
+}
+
 func TestConfigValidate_NegativeKubeAPIQPS(t *testing.T) {
 	cfg := &Config{APIConfig: APIConfig{AuthType: AuthTypeServiceAccount, KubeAPIQPS: -1}}
 	assert.Error(t, cfg.Validate())
@@ -97,4 +125,23 @@ func TestLoadConfig_Testdata(t *testing.T) {
 	assert.Equal(t, 1*time.Second, cfg.ReconnectBackoff.InitialInterval)
 	assert.Equal(t, 30*time.Second, cfg.ReconnectBackoff.MaxInterval)
 	assert.Equal(t, 5*time.Minute, cfg.ReconnectBackoff.MaxElapsedTime)
+	assert.Equal(t, 500, cfg.MaxBatchSize)
+	assert.Equal(t, 250*time.Millisecond, cfg.FlushInterval)
+}
+
+func TestConfigValidate_NegativeMaxBatchSize(t *testing.T) {
+	cfg := &Config{APIConfig: APIConfig{AuthType: AuthTypeServiceAccount}, MaxBatchSize: -1}
+	assert.Error(t, cfg.Validate())
+}
+
+func TestConfigValidate_NegativeFlushInterval(t *testing.T) {
+	cfg := &Config{APIConfig: APIConfig{AuthType: AuthTypeServiceAccount}, FlushInterval: -1 * time.Second}
+	assert.Error(t, cfg.Validate())
+}
+
+func TestConfigValidate_ZeroBatchingMeansDefault(t *testing.T) {
+	// Zero MaxBatchSize / FlushInterval is valid: the receiver falls back to
+	// the package defaults, mirroring the KubeAPIQPS "zero means default" idiom.
+	cfg := &Config{APIConfig: APIConfig{AuthType: AuthTypeServiceAccount}}
+	assert.NoError(t, cfg.Validate())
 }

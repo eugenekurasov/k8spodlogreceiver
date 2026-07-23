@@ -127,6 +127,8 @@ receivers:
       max_elapsed_time: 5m
     max_batch_size: 1000
     flush_interval: 200ms
+    max_log_size: 1048576
+    max_log_size_behavior: split
 ```
 
 - `api_config.auth_type` (default `serviceAccount`): how to authenticate to
@@ -191,6 +193,23 @@ receivers:
   latency a low-volume stream would otherwise incur waiting to accumulate
   `max_batch_size` lines, so batching never trades throughput for unbounded
   delivery delay.
+- `max_log_size` (default `1048576` = 1 MiB, `0` means use the default): the
+  maximum size, in bytes, of a single emitted log record body. It also bounds
+  the per-stream read buffer, so a pathologically long line can't grow memory
+  without limit. A physical log line longer than this is handled per
+  `max_log_size_behavior` — never silently dropped.
+- `max_log_size_behavior` (default `split`): what to do with a log line longer
+  than `max_log_size`, mirroring the filelog receiver's option of the same
+  name.
+  - `split`: preserve all data by emitting the line as consecutive
+    `max_log_size`-sized records. Nothing is lost; a very long line simply
+    arrives as several records. Only the first record carries the line's
+    original timestamp — continuation records are stamped with the receive
+    time, since the kubelet emits the RFC3339 prefix only once per physical
+    line.
+  - `truncate`: emit the first `max_log_size` bytes of the line and drop the
+    remainder up to the next newline. Use when a bounded head of each line is
+    enough and you'd rather not fan a huge line out into many records.
 
 The full field definitions live in [`config.go`](./config.go), with a
 working sample in [`testdata/config.yaml`](./testdata/config.yaml).

@@ -8,6 +8,7 @@ import (
 	"go.opentelemetry.io/collector/consumer"
 	"go.opentelemetry.io/collector/receiver"
 
+	"github.com/eugenekurasov/security-observability-stack/otel-components/k8spodlogreceiver/internal/logline"
 	"github.com/eugenekurasov/security-observability-stack/otel-components/k8spodlogreceiver/internal/metadata"
 )
 
@@ -30,8 +31,10 @@ func createDefaultConfig() component.Config {
 			MaxInterval:     30 * time.Second,
 			MaxElapsedTime:  5 * time.Minute,
 		},
-		MaxBatchSize:  defaultMaxBatchSize,
-		FlushInterval: defaultFlushInterval,
+		MaxBatchSize:       defaultMaxBatchSize,
+		FlushInterval:      defaultFlushInterval,
+		MaxLogSize:         defaultMaxLogSize,
+		MaxLogSizeBehavior: logline.BehaviorSplitName,
 	}
 }
 

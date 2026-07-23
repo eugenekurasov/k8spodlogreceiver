@@ -6,11 +6,13 @@ package k8spodlogreceiver
 
 import (
 	"errors"
+	"fmt"
 	"time"
 
 	"go.opentelemetry.io/collector/component"
 
 	"github.com/eugenekurasov/security-observability-stack/otel-components/k8spodlogreceiver/internal/k8sconfig"
+	"github.com/eugenekurasov/security-observability-stack/otel-components/k8spodlogreceiver/internal/logline"
 )
 
 // Config defines the user-facing configuration for the k8spodlog receiver.
@@ -59,6 +61,19 @@ type Config struct {
 	// to accumulate MaxBatchSize lines. Zero means "use the default"
 	// (defaultFlushInterval); negative is rejected by Validate.
 	FlushInterval time.Duration `mapstructure:"flush_interval"`
+
+	// MaxLogSize is the maximum size, in bytes, of a single emitted log record
+	// body. A physical log line longer than this is handled per
+	// MaxLogSizeBehavior rather than being dropped. Zero means "use the
+	// default" (defaultMaxLogSize); negative is rejected by Validate.
+	MaxLogSize int `mapstructure:"max_log_size"`
+
+	// MaxLogSizeBehavior controls what happens to a log line longer than
+	// MaxLogSize. "split" (the default) preserves all data by emitting the line
+	// as consecutive MaxLogSize-sized records; "truncate" emits the first
+	// MaxLogSize bytes and drops the remainder of that line. Empty means the
+	// default. Mirrors the filelog receiver's max_log_size_behavior.
+	MaxLogSizeBehavior string `mapstructure:"max_log_size_behavior"`
 }
 
 const (
@@ -67,6 +82,10 @@ const (
 	// constructed without a fully-populated Config (e.g. in unit tests).
 	defaultMaxBatchSize  = 1000
 	defaultFlushInterval = 200 * time.Millisecond
+
+	// defaultMaxLogSize is the fallback per-record size cap (1 MiB), matching
+	// the filelog receiver's default max_log_size.
+	defaultMaxLogSize = 1024 * 1024
 )
 
 // APIConfig controls how the receiver authenticates to the API server.
@@ -130,6 +149,12 @@ func (cfg *Config) Validate() error {
 	}
 	if cfg.FlushInterval < 0 {
 		return errors.New("k8spodlogreceiver: flush_interval must be >= 0")
+	}
+	if cfg.MaxLogSize < 0 {
+		return errors.New("k8spodlogreceiver: max_log_size must be >= 0")
+	}
+	if _, err := logline.ParseBehavior(cfg.MaxLogSizeBehavior); err != nil {
+		return fmt.Errorf("k8spodlogreceiver: max_log_size_behavior %w", err)
 	}
 	return cfg.APIConfig.Validate()
 }

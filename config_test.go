@@ -127,6 +127,8 @@ func TestLoadConfig_Testdata(t *testing.T) {
 	assert.Equal(t, 5*time.Minute, cfg.ReconnectBackoff.MaxElapsedTime)
 	assert.Equal(t, 500, cfg.MaxBatchSize)
 	assert.Equal(t, 250*time.Millisecond, cfg.FlushInterval)
+	assert.Equal(t, 2097152, cfg.MaxLogSize)
+	assert.Equal(t, "truncate", cfg.MaxLogSizeBehavior)
 }
 
 func TestConfigValidate_NegativeMaxBatchSize(t *testing.T) {
@@ -144,4 +146,26 @@ func TestConfigValidate_ZeroBatchingMeansDefault(t *testing.T) {
 	// the package defaults, mirroring the KubeAPIQPS "zero means default" idiom.
 	cfg := &Config{APIConfig: APIConfig{AuthType: AuthTypeServiceAccount}}
 	assert.NoError(t, cfg.Validate())
+}
+
+func TestConfigValidate_NegativeMaxLogSize(t *testing.T) {
+	cfg := &Config{APIConfig: APIConfig{AuthType: AuthTypeServiceAccount}, MaxLogSize: -1}
+	assert.Error(t, cfg.Validate())
+}
+
+func TestConfigValidate_ZeroMaxLogSizeMeansDefault(t *testing.T) {
+	// Zero MaxLogSize is valid: the receiver falls back to the 1 MiB default.
+	cfg := &Config{APIConfig: APIConfig{AuthType: AuthTypeServiceAccount}}
+	assert.NoError(t, cfg.Validate())
+}
+
+func TestConfigValidate_MaxLogSizeBehavior(t *testing.T) {
+	base := APIConfig{AuthType: AuthTypeServiceAccount}
+	for _, behavior := range []string{"", "split", "truncate"} {
+		cfg := &Config{APIConfig: base, MaxLogSizeBehavior: behavior}
+		assert.NoErrorf(t, cfg.Validate(), "behavior %q must be accepted", behavior)
+	}
+
+	cfg := &Config{APIConfig: base, MaxLogSizeBehavior: "nonsense"}
+	assert.Error(t, cfg.Validate(), "an unknown behavior must be rejected")
 }

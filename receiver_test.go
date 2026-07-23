@@ -22,6 +22,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/watch"
 
+	"github.com/eugenekurasov/security-observability-stack/otel-components/k8spodlogreceiver/internal/logline"
 	"github.com/eugenekurasov/security-observability-stack/otel-components/k8spodlogreceiver/internal/metadata"
 )
 
@@ -344,7 +345,7 @@ func TestStreamConnection_BatchesLinesBySize(t *testing.T) {
 		b.WriteString("line\n")
 	}
 	_, scanErr := r.streamConnection(context.Background(), strings.NewReader(b.String()),
-		batchMeta{namespace: "ns", podName: "pod", podUID: "uid", containerName: "c"})
+		logline.Meta{Namespace: "ns", PodName: "pod", PodUID: "uid", ContainerName: "c"})
 
 	require.NoError(t, scanErr)
 	assert.Equal(t, 2, len(sink.AllLogs()), "6 lines / batch 3 should produce 2 batches")
@@ -374,7 +375,7 @@ func TestStreamConnection_FlushesPartialBatchByInterval(t *testing.T) {
 	}()
 
 	_, scanErr := r.streamConnection(context.Background(), pr,
-		batchMeta{namespace: "ns", podName: "pod", podUID: "uid", containerName: "c"})
+		logline.Meta{Namespace: "ns", PodName: "pod", PodUID: "uid", ContainerName: "c"})
 
 	require.NoError(t, scanErr)
 	require.GreaterOrEqual(t, len(sink.AllLogs()), 1, "partial batch must be flushed by the interval")
@@ -391,11 +392,37 @@ func TestStreamConnection_AdvancesCursorToLastTimestampOnSuccess(t *testing.T) {
 
 	input := "2024-01-15T10:00:04.900000000Z a\n2024-01-15T10:00:05.800000000Z b\n"
 	lastTS, _ := r.streamConnection(context.Background(), strings.NewReader(input),
-		batchMeta{namespace: "ns", podName: "pod", podUID: "uid", containerName: "c"})
+		logline.Meta{Namespace: "ns", PodName: "pod", PodUID: "uid", ContainerName: "c"})
 
 	want, err := time.Parse(time.RFC3339Nano, "2024-01-15T10:00:05.800000000Z")
 	require.NoError(t, err)
 	assert.True(t, lastTS.Equal(want), "cursor must advance to the newest delivered line, got %v", lastTS)
+}
+
+// TestStreamConnection_StripsTimestampPrefixFromBody guards against the leading
+// RFC3339 timestamp (emitted because PodLogOptions.Timestamps is true) being
+// duplicated into both the record Timestamp and its Body. The emitLogLine tests
+// do not exercise this because they bypass the scan/parse path.
+func TestStreamConnection_StripsTimestampPrefixFromBody(t *testing.T) {
+	sink := &consumertest.LogsSink{}
+	r := &logsReceiver{
+		settings: receivertest.NewNopSettings(metadata.Type),
+		consumer: sink,
+		cfg:      &Config{MaxBatchSize: 10, FlushInterval: time.Hour},
+	}
+
+	input := "2024-01-15T10:00:04.900000000Z hello world\n"
+	_, scanErr := r.streamConnection(context.Background(), strings.NewReader(input),
+		logline.Meta{Namespace: "ns", PodName: "pod", PodUID: "uid", ContainerName: "c"})
+
+	require.NoError(t, scanErr)
+	require.Equal(t, 1, sink.LogRecordCount())
+	rec := sink.AllLogs()[0].ResourceLogs().At(0).ScopeLogs().At(0).LogRecords().At(0)
+	assert.Equal(t, "hello world", rec.Body().Str(), "the timestamp prefix must not appear in the body")
+
+	want, err := time.Parse(time.RFC3339Nano, "2024-01-15T10:00:04.900000000Z")
+	require.NoError(t, err)
+	assert.True(t, rec.Timestamp().AsTime().Equal(want), "the parsed timestamp must still populate the record Timestamp")
 }
 
 // TestStreamConnection_FailedConsumeDoesNotAdvanceCursor guards the reconnect
@@ -411,9 +438,98 @@ func TestStreamConnection_FailedConsumeDoesNotAdvanceCursor(t *testing.T) {
 
 	input := "2024-01-15T10:00:04.900000000Z a\n2024-01-15T10:00:05.800000000Z b\n"
 	lastTS, _ := r.streamConnection(context.Background(), strings.NewReader(input),
-		batchMeta{namespace: "ns", podName: "pod", podUID: "uid", containerName: "c"})
+		logline.Meta{Namespace: "ns", PodName: "pod", PodUID: "uid", ContainerName: "c"})
 
 	assert.True(t, lastTS.IsZero(), "cursor must not advance when the consumer rejects the batch")
+}
+
+// collectBodies flattens every log record body the sink received, in order.
+func collectBodies(sink *consumertest.LogsSink) []string {
+	var bodies []string
+	for _, ld := range sink.AllLogs() {
+		recs := ld.ResourceLogs().At(0).ScopeLogs().At(0).LogRecords()
+		for i := 0; i < recs.Len(); i++ {
+			bodies = append(bodies, recs.At(i).Body().Str())
+		}
+	}
+	return bodies
+}
+
+func TestStreamConnection_SplitsOversizedLineByDefault(t *testing.T) {
+	sink := &consumertest.LogsSink{}
+	r := &logsReceiver{
+		settings: receivertest.NewNopSettings(metadata.Type),
+		consumer: sink,
+		// Cap chosen above the ~32-byte timestamped lines but below the big line,
+		// so only the middle line is oversized; behavior defaults to split.
+		cfg: &Config{MaxBatchSize: 10, FlushInterval: time.Hour, MaxLogSize: 40},
+	}
+
+	oversized := strings.Repeat("x", 100) // 100 > 40 -> chunks of 40 + 40 + 20
+	input := "2024-01-15T10:00:04.900000000Z a\n" +
+		oversized + "\n" +
+		"2024-01-15T10:00:05.800000000Z c\n"
+
+	lastTS, scanErr := r.streamConnection(context.Background(), strings.NewReader(input),
+		logline.Meta{Namespace: "ns", PodName: "pod", PodUID: "uid", ContainerName: "c"})
+
+	require.NoError(t, scanErr, "oversized line must be handled in-stream, not surfaced as an error that triggers a reconnect")
+
+	bodies := collectBodies(sink)
+	assert.Equal(t, 5, len(bodies), "2 small lines + 3 split chunks of the oversized line")
+
+	// Split loses nothing: the chunk bodies must reconstruct the whole line.
+	var reconstructed string
+	for _, b := range bodies {
+		if strings.HasPrefix(b, "x") {
+			reconstructed += b
+			assert.LessOrEqual(t, len(b), 40, "no split chunk may exceed max_log_size")
+		}
+	}
+	assert.Equal(t, oversized, reconstructed, "split must preserve the entire oversized line, losing nothing")
+
+	// The cursor must advance to the line after the oversized one (the split
+	// chunks carry no timestamp of their own).
+	want, err := time.Parse(time.RFC3339Nano, "2024-01-15T10:00:05.800000000Z")
+	require.NoError(t, err)
+	assert.True(t, lastTS.Equal(want), "cursor must advance to the line after the oversized one, got %v", lastTS)
+}
+
+// With max_log_size_behavior=truncate an oversized line keeps its head (the
+// first max_log_size bytes) and drops the remainder up to the next newline.
+func TestStreamConnection_TruncatesOversizedLineWhenConfigured(t *testing.T) {
+	sink := &consumertest.LogsSink{}
+	r := &logsReceiver{
+		settings: receivertest.NewNopSettings(metadata.Type),
+		consumer: sink,
+		cfg: &Config{
+			MaxBatchSize:       10,
+			FlushInterval:      time.Hour,
+			MaxLogSize:         40,
+			MaxLogSizeBehavior: "truncate",
+		},
+	}
+
+	oversized := strings.Repeat("x", 100)
+	input := "2024-01-15T10:00:04.900000000Z a\n" +
+		oversized + "\n" +
+		"2024-01-15T10:00:05.800000000Z c\n"
+
+	lastTS, scanErr := r.streamConnection(context.Background(), strings.NewReader(input),
+		logline.Meta{Namespace: "ns", PodName: "pod", PodUID: "uid", ContainerName: "c"})
+
+	require.NoError(t, scanErr)
+
+	bodies := collectBodies(sink)
+	assert.Equal(t, 3, len(bodies), "2 small lines + the truncated head of the oversized line")
+	assert.Contains(t, bodies, strings.Repeat("x", 40), "the first max_log_size bytes of the oversized line must be kept")
+	for _, b := range bodies {
+		assert.LessOrEqual(t, len(b), 40, "no record may exceed max_log_size")
+	}
+
+	want, err := time.Parse(time.RFC3339Nano, "2024-01-15T10:00:05.800000000Z")
+	require.NoError(t, err)
+	assert.True(t, lastTS.Equal(want), "cursor must advance to the line after the oversized one, got %v", lastTS)
 }
 
 func TestStreamConnection_CancelStopsAndFlushes(t *testing.T) {
@@ -436,7 +552,7 @@ func TestStreamConnection_CancelStopsAndFlushes(t *testing.T) {
 	// Must return promptly (reader goroutine exits) and not deadlock.
 	done := make(chan struct{})
 	go func() {
-		_, _ = r.streamConnection(ctx, pr, batchMeta{namespace: "ns", podName: "pod", podUID: "uid", containerName: "c"})
+		_, _ = r.streamConnection(ctx, pr, logline.Meta{Namespace: "ns", PodName: "pod", PodUID: "uid", ContainerName: "c"})
 		close(done)
 	}()
 	select {
@@ -444,25 +560,6 @@ func TestStreamConnection_CancelStopsAndFlushes(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("streamConnection did not return after cancel — possible goroutine leak")
 	}
-}
-
-// ---- parseLeadingTimestamp ----
-
-func TestParseLeadingTimestamp_ParsesValidTimestamp(t *testing.T) {
-	ts := parseLeadingTimestamp("2024-01-15T10:30:00.123456789Z log line content")
-	want, err := time.Parse(time.RFC3339Nano, "2024-01-15T10:30:00.123456789Z")
-	require.NoError(t, err)
-	assert.True(t, ts.Equal(want))
-}
-
-func TestParseLeadingTimestamp_NoSpace(t *testing.T) {
-	ts := parseLeadingTimestamp("nospacehere")
-	assert.True(t, ts.IsZero())
-}
-
-func TestParseLeadingTimestamp_UnparseableTimestamp(t *testing.T) {
-	ts := parseLeadingTimestamp("not-a-timestamp rest of line")
-	assert.True(t, ts.IsZero())
 }
 
 // ---- classifyStreamError ----
@@ -506,51 +603,4 @@ func TestEmitLogLine_WithRealObsreportAndTelemetry_NoPanic(t *testing.T) {
 		r.emitLogLine("ns", "pod", "uid", "c", "hello", time.Time{})
 	})
 	require.Len(t, sink.AllLogs(), 1)
-}
-
-// ---- discardOversizedLine ----
-
-// chunkedReader simulates a network stream that returns data in chunks.
-type chunkedReader struct {
-	data      []byte
-	chunkSize int
-	pos       int
-}
-
-func newChunkedReader(data []byte, chunkSize int) *chunkedReader {
-	return &chunkedReader{data: data, chunkSize: chunkSize, pos: 0}
-}
-
-func (cr *chunkedReader) Read(p []byte) (int, error) {
-	if cr.pos >= len(cr.data) {
-		return 0, io.EOF
-	}
-	n := cr.chunkSize
-	if n > len(p) {
-		n = len(p)
-	}
-	if cr.pos+n > len(cr.data) {
-		n = len(cr.data) - cr.pos
-	}
-	copy(p, cr.data[cr.pos:cr.pos+n])
-	cr.pos += n
-	return n, nil
-}
-
-func TestDiscardOversizedLine_SkipsRestOfLine(t *testing.T) {
-	// Verify that discardOversizedLine reads until it finds a newline without error.
-	data := strings.Repeat("x", 5000) + "\n" + "next line\n"
-	reader := newChunkedReader([]byte(data), 1024)
-
-	// Should not panic or error
-	discardOversizedLine(reader)
-}
-
-func TestDiscardOversizedLine_HandlesMultipleChunks(t *testing.T) {
-	// Verify that discardOversizedLine handles data spanning multiple buffer chunks.
-	data := strings.Repeat("x", 64*1024) + "\n" + "after\n"
-	reader := newChunkedReader([]byte(data), 8192)
-
-	// Should not panic or error
-	discardOversizedLine(reader)
 }

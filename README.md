@@ -14,11 +14,7 @@ in production.
 
 ## Kubernetes version compatibility
 
-| Kubernetes | Status |
-|---|---|
-| 1.36 | CI configured — pending first run |
-| 1.35 | CI configured — pending first run |
-| 1.34 | CI configured — pending first run |
+[![K8s compatibility tests](https://github.com/eugenekurasov/security-observability-stack/actions/workflows/integration.yml/badge.svg?branch=main)](https://github.com/eugenekurasov/security-observability-stack/actions/workflows/integration.yml)
 
 All APIs used by this receiver are stable `core/v1` endpoints (`pods`,
 `pods/log`) present and unchanged since Kubernetes 1.3. Label selectors
@@ -305,14 +301,11 @@ and retry.
   same pods, producing duplicate log records. HA requires distributed
   stream ownership (e.g. consistent-hash ring + lease coordination) —
   not yet implemented.
-- Not yet submitted upstream. Intent is to prototype, test against a
-  real cluster, and open a discussion on #23339 proposing this as an
-  additional collection mode rather than a replacement.
 
 ## Relation to the broader security-observability-stack project
 
 This receiver is one component of a larger effort
-(`../../terraform`, `../../helm`) to package a compliance-oriented,
+(`../../helm`) to package a compliance-oriented,
 multi-tenant observability stack (OTel Collector → Prometheus →
 backend) with sane defaults for regulated environments. See
 [`../../docs/architecture.md`](../../docs/architecture.md).

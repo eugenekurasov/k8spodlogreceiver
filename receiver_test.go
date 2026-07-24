@@ -10,7 +10,9 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.opentelemetry.io/collector/consumer"
 	"go.opentelemetry.io/collector/consumer/consumertest"
+	"go.opentelemetry.io/collector/pdata/plog"
 	"go.opentelemetry.io/collector/receiver/receiverhelper"
 	"go.opentelemetry.io/collector/receiver/receivertest"
 
@@ -46,12 +48,6 @@ func makePod(ns, name string, containers ...string) *corev1.Pod {
 		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
 		Spec:       corev1.PodSpec{Containers: specs},
 	}
-}
-
-func makePodWithPhase(ns, name string, phase corev1.PodPhase, containers ...string) *corev1.Pod {
-	pod := makePod(ns, name, containers...)
-	pod.Status.Phase = phase
-	return pod
 }
 
 // podEvent wraps a typed pod as an Observer watch event, mirroring how the
@@ -172,61 +168,134 @@ func TestOnPodDeleted_MultiContainer(t *testing.T) {
 	assert.True(t, cancelledB, "container-b stream must be cancelled")
 }
 
-func TestMarkPodPhase_SucceededMarksTerminal(t *testing.T) {
-	r := newTestReceiver()
-	r.markPodPhase(makePodWithPhase("default", "job-abc", corev1.PodSucceeded, "app"))
-	assert.True(t, r.isPodTerminal("default", "job-abc"))
+func terminatedStatus(name string, exitCode int32) corev1.ContainerStatus {
+	return corev1.ContainerStatus{
+		Name:  name,
+		State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: exitCode}},
+	}
 }
 
-func TestMarkPodPhase_FailedMarksTerminal(t *testing.T) {
-	r := newTestReceiver()
-	r.markPodPhase(makePodWithPhase("default", "job-abc", corev1.PodFailed, "app"))
-	assert.True(t, r.isPodTerminal("default", "job-abc"))
+func runningStatus(name string) corev1.ContainerStatus {
+	return corev1.ContainerStatus{
+		Name:  name,
+		State: corev1.ContainerState{Running: &corev1.ContainerStateRunning{}},
+	}
 }
 
-func TestMarkPodPhase_RunningDoesNotMarkTerminal(t *testing.T) {
+func TestMarkContainerStates_MultiContainerJob(t *testing.T) {
 	r := newTestReceiver()
-	r.markPodPhase(makePodWithPhase("default", "app-abc", corev1.PodRunning, "app"))
-	assert.False(t, r.isPodTerminal("default", "app-abc"))
+	pod := makePod("batch", "job-abc", "worker", "helper")
+	pod.Spec.RestartPolicy = corev1.RestartPolicyNever
+	pod.Status.Phase = corev1.PodRunning // still Running: helper hasn't exited
+	pod.Status.ContainerStatuses = []corev1.ContainerStatus{
+		terminatedStatus("worker", 0),
+		runningStatus("helper"),
+	}
+
+	r.markContainerStates(pod)
+
+	assert.True(t, r.isContainerTerminal("batch/job-abc/worker"), "finished container must be terminal even though pod phase is Running")
+	assert.False(t, r.isContainerTerminal("batch/job-abc/helper"), "still-running container must not be terminal")
 }
 
-func TestIsPodTerminal_UnknownPod_ReturnsFalse(t *testing.T) {
+func TestMarkContainerStates_RestartPolicyAlways_NeverTerminal(t *testing.T) {
 	r := newTestReceiver()
-	assert.False(t, r.isPodTerminal("default", "never-seen"))
+	// A CrashLooping container: momentarily Terminated but will be restarted.
+	pod := makePod("default", "app-abc", "app")
+	pod.Spec.RestartPolicy = corev1.RestartPolicyAlways
+	pod.Status.ContainerStatuses = []corev1.ContainerStatus{terminatedStatus("app", 1)}
+
+	r.markContainerStates(pod)
+
+	assert.False(t, r.isContainerTerminal("default/app-abc/app"), "Always container must keep following restarts")
 }
 
-func TestOnPodAdded_AlreadyTerminalPod_MarkedTerminalButStreamsStillStart(t *testing.T) {
+func TestMarkContainerStates_OnFailure(t *testing.T) {
 	r := newTestReceiver()
+	pod := makePod("default", "job-of", "task")
+	pod.Spec.RestartPolicy = corev1.RestartPolicyOnFailure
+	pod.Status.ContainerStatuses = []corev1.ContainerStatus{terminatedStatus("task", 0)}
+	r.markContainerStates(pod)
+	assert.True(t, r.isContainerTerminal("default/job-of/task"), "OnFailure + exit 0 is terminal")
+
+	r2 := newTestReceiver()
+	podFail := makePod("default", "job-of", "task")
+	podFail.Spec.RestartPolicy = corev1.RestartPolicyOnFailure
+	podFail.Status.ContainerStatuses = []corev1.ContainerStatus{terminatedStatus("task", 2)}
+	r2.markContainerStates(podFail)
+	assert.False(t, r2.isContainerTerminal("default/job-of/task"), "OnFailure + non-zero exit will restart, not terminal")
+}
+
+func TestMarkContainerStates_NativeSidecar(t *testing.T) {
+	r := newTestReceiver()
+	always := corev1.ContainerRestartPolicyAlways
+	pod := makePod("mesh", "app-abc", "app")
+	pod.Spec.RestartPolicy = corev1.RestartPolicyNever
+	pod.Spec.InitContainers = []corev1.Container{{Name: "proxy", RestartPolicy: &always}}
+	pod.Status.InitContainerStatuses = []corev1.ContainerStatus{terminatedStatus("proxy", 0)}
+
+	r.markContainerStates(pod)
+
+	assert.False(t, r.isContainerTerminal("mesh/app-abc/proxy"), "native sidecar must not be terminal on a Terminated status")
+}
+
+func TestMarkContainerStates_RegularInitContainer(t *testing.T) {
+	r := newTestReceiver()
+	pod := makePod("default", "app-abc", "app")
+	pod.Spec.RestartPolicy = corev1.RestartPolicyAlways
+	pod.Spec.InitContainers = []corev1.Container{{Name: "migrate"}} // no per-container policy
+	pod.Status.InitContainerStatuses = []corev1.ContainerStatus{terminatedStatus("migrate", 0)}
+
+	r.markContainerStates(pod)
+
+	assert.True(t, r.isContainerTerminal("default/app-abc/migrate"), "completed regular init container is terminal")
+}
+
+func TestIsContainerTerminal_Unknown_ReturnsFalse(t *testing.T) {
+	r := newTestReceiver()
+	assert.False(t, r.isContainerTerminal("default/never-seen/app"))
+}
+
+func TestEnsureStreams_CoversInitContainers(t *testing.T) {
+	r := newTestReceiver()
+	always := corev1.ContainerRestartPolicyAlways
+	pod := makePod("mesh", "app-abc", "app")
+	pod.Spec.InitContainers = []corev1.Container{
+		{Name: "migrate"},
+		{Name: "proxy", RestartPolicy: &always},
+	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	// Simulates the receiver discovering a pod that already completed
-	// before it was ever seen (e.g. a Job that finished before the receiver
-	// started, or before the pod was added to this receiver's watch).
-	r.onPodAdded(ctx, makePodWithPhase("batch", "job-xyz", corev1.PodSucceeded, "worker"))
-
-	assert.True(t, r.isPodTerminal("batch", "job-xyz"), "pod discovered already-terminal must be marked terminal")
+	r.onPodAdded(ctx, pod)
 
 	r.mu.Lock()
-	_, hasStream := r.activeStreams["batch/job-xyz/worker"]
+	_, hasApp := r.activeStreams["mesh/app-abc/app"]
+	_, hasMigrate := r.activeStreams["mesh/app-abc/migrate"]
+	_, hasProxy := r.activeStreams["mesh/app-abc/proxy"]
 	r.mu.Unlock()
-	assert.True(t, hasStream, "a stream must still be started once, to pick up any existing log content")
+
+	assert.True(t, hasApp, "main container stream expected")
+	assert.True(t, hasMigrate, "regular init container stream expected")
+	assert.True(t, hasProxy, "native sidecar stream expected")
 
 	cancel()
 	r.wg.Wait()
 }
 
-func TestOnPodDeleted_ClearsTerminatedPodEntry(t *testing.T) {
+func TestOnPodDeleted_ClearsTerminatedContainerEntries(t *testing.T) {
 	r := newTestReceiver()
-	pod := makePodWithPhase("default", "job-abc", corev1.PodSucceeded, "app")
+	pod := makePod("default", "job-abc", "app")
+	pod.Spec.RestartPolicy = corev1.RestartPolicyNever
+	pod.Status.ContainerStatuses = []corev1.ContainerStatus{terminatedStatus("app", 0)}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	r.onPodAdded(ctx, pod)
-	require.True(t, r.isPodTerminal("default", "job-abc"))
+	require.True(t, r.isContainerTerminal("default/job-abc/app"))
 
 	r.onPodDeleted(pod)
-	assert.False(t, r.isPodTerminal("default", "job-abc"), "terminatedPods entry must be cleared on delete")
+	assert.False(t, r.isContainerTerminal("default/job-abc/app"), "terminatedContainers entry must be cleared on delete")
 
 	cancel()
 	r.wg.Wait()
@@ -271,7 +340,7 @@ func TestEmitLogLine_PopulatesResourceAttributes(t *testing.T) {
 		consumer: sink,
 	}
 
-	r.emitLogLine("payments", "app-abc", "abc-123-uid", "api", "hello world", time.Time{})
+	r.emitLogLine(context.Background(), "payments", "app-abc", "abc-123-uid", "api", "hello world", time.Time{})
 
 	require.Len(t, sink.AllLogs(), 1)
 	rl := sink.AllLogs()[0].ResourceLogs().At(0)
@@ -290,7 +359,7 @@ func TestEmitLogLine_PopulatesBody(t *testing.T) {
 		consumer: sink,
 	}
 
-	r.emitLogLine("ns", "pod", "uid", "c", "log line content", time.Time{})
+	r.emitLogLine(context.Background(), "ns", "pod", "uid", "c", "log line content", time.Time{})
 
 	require.Len(t, sink.AllLogs(), 1)
 	body := sink.AllLogs()[0].ResourceLogs().At(0).ScopeLogs().At(0).LogRecords().At(0).Body().Str()
@@ -305,7 +374,7 @@ func TestEmitLogLine_FallsBackToNowWhenTimestampZero(t *testing.T) {
 	}
 
 	before := time.Now()
-	r.emitLogLine("ns", "pod", "uid", "c", "ts test", time.Time{})
+	r.emitLogLine(context.Background(), "ns", "pod", "uid", "c", "ts test", time.Time{})
 	after := time.Now()
 
 	require.Len(t, sink.AllLogs(), 1)
@@ -321,7 +390,7 @@ func TestEmitLogLine_UsesProvidedTimestamp(t *testing.T) {
 	}
 
 	want := time.Date(2024, 1, 15, 10, 30, 0, 0, time.UTC)
-	r.emitLogLine("ns", "pod", "uid", "c", "ts test", want)
+	r.emitLogLine(context.Background(), "ns", "pod", "uid", "c", "ts test", want)
 
 	require.Len(t, sink.AllLogs(), 1)
 	got := sink.AllLogs()[0].ResourceLogs().At(0).ScopeLogs().At(0).LogRecords().At(0).Timestamp().AsTime()
@@ -562,6 +631,59 @@ func TestStreamConnection_CancelStopsAndFlushes(t *testing.T) {
 	}
 }
 
+type blockingConsumer struct {
+	entered chan struct{}
+	once    sync.Once
+}
+
+func (c *blockingConsumer) Capabilities() consumer.Capabilities {
+	return consumer.Capabilities{MutatesData: false}
+}
+
+func (c *blockingConsumer) ConsumeLogs(ctx context.Context, _ plog.Logs) error {
+	c.once.Do(func() { close(c.entered) })
+	<-ctx.Done()
+	return ctx.Err()
+}
+
+func TestStreamConnection_ConsumeUnblocksOnContextCancel(t *testing.T) {
+	c := &blockingConsumer{entered: make(chan struct{})}
+	r := &logsReceiver{
+		settings: receivertest.NewNopSettings(metadata.Type),
+		consumer: c,
+		// Batch size 1 flushes on the first line, entering the blocked
+		// ConsumeLogs immediately — the exact Shutdown deadlock scenario.
+		cfg: &Config{MaxBatchSize: 1, FlushInterval: time.Hour},
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	pr, pw := io.Pipe()
+	go func() { _, _ = io.WriteString(pw, "line\n") }()
+
+	done := make(chan struct{})
+	go func() {
+		_, _ = r.streamConnection(ctx, pr, logline.Meta{Namespace: "ns", PodName: "pod", PodUID: "uid", ContainerName: "c"})
+		close(done)
+	}()
+
+	select {
+	case <-c.entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("ConsumeLogs was never reached — batch never flushed")
+	}
+
+	cancel()       // the Shutdown r.cancel()
+	_ = pw.Close() // model req.Stream(ctx)'s Read aborting once ctx is cancelled
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("streamConnection did not return after ctx cancel — ConsumeLogs ignored shutdown (deadlock)")
+	}
+}
+
 // ---- classifyStreamError ----
 
 func TestClassifyStreamError_Forbidden(t *testing.T) {
@@ -600,7 +722,7 @@ func TestEmitLogLine_WithRealObsreportAndTelemetry_NoPanic(t *testing.T) {
 	}
 
 	require.NotPanics(t, func() {
-		r.emitLogLine("ns", "pod", "uid", "c", "hello", time.Time{})
+		r.emitLogLine(context.Background(), "ns", "pod", "uid", "c", "hello", time.Time{})
 	})
 	require.Len(t, sink.AllLogs(), 1)
 }

@@ -58,13 +58,13 @@ type logsReceiver struct {
 	// dynamicClient drives pod discovery through the watch.Observer. It shares
 	// httpClient's transport (built from the same rest.Config) so Shutdown's
 	// CloseIdleConnections() covers it too.
-	dynamicClient  dynamic.Interface
-	httpClient     *http.Client
-	cancel         context.CancelFunc
-	wg             sync.WaitGroup
-	mu             sync.Mutex
-	activeStreams  map[string]context.CancelFunc
-	terminatedPods map[string]struct{}
+	dynamicClient        dynamic.Interface
+	httpClient           *http.Client
+	cancel               context.CancelFunc
+	wg                   sync.WaitGroup
+	mu                   sync.Mutex
+	activeStreams        map[string]context.CancelFunc
+	terminatedContainers map[string]struct{}
 	//It is a field so tests can substitute a no-op without a real API server.
 	startStream func(ctx context.Context, namespace, podName, podUID, containerName, key string)
 	obsrep      *receiverhelper.ObsReport
@@ -87,13 +87,13 @@ func newLogsReceiver(settings receiver.Settings, cfg *Config, c consumer.Logs) (
 	}
 
 	r := &logsReceiver{
-		cfg:            cfg,
-		settings:       settings,
-		consumer:       c,
-		activeStreams:  make(map[string]context.CancelFunc),
-		terminatedPods: make(map[string]struct{}),
-		obsrep:         obsrep,
-		telemetry:      telemetryBuilder,
+		cfg:                  cfg,
+		settings:             settings,
+		consumer:             c,
+		activeStreams:        make(map[string]context.CancelFunc),
+		terminatedContainers: make(map[string]struct{}),
+		obsrep:               obsrep,
+		telemetry:            telemetryBuilder,
 	}
 	r.startStream = r.streamContainerLogs
 	return r, nil
@@ -187,7 +187,7 @@ func (r *logsReceiver) handlePodEvent(ctx context.Context, event *apiWatch.Event
 	case apiWatch.Added:
 		r.onPodAdded(ctx, pod)
 	case apiWatch.Modified:
-		r.markPodPhase(pod)
+		r.markContainerStates(pod)
 		r.ensureStreams(ctx, pod)
 	case apiWatch.Deleted:
 		r.onPodDeleted(pod)
@@ -199,12 +199,16 @@ func (r *logsReceiver) onPodAdded(ctx context.Context, pod *corev1.Pod) {
 		r.telemetry.PodDiscoveryEventsTotal.Add(ctx, 1, metric.WithAttributes(attribute.String("event_type", eventTypeAdded)))
 	}
 
-	r.markPodPhase(pod)
+	r.markContainerStates(pod)
 	r.ensureStreams(ctx, pod)
 }
 
 func (r *logsReceiver) ensureStreams(ctx context.Context, pod *corev1.Pod) {
-	for _, container := range pod.Spec.Containers {
+	containers := make([]corev1.Container, 0, len(pod.Spec.InitContainers)+len(pod.Spec.Containers))
+	containers = append(containers, pod.Spec.InitContainers...)
+	containers = append(containers, pod.Spec.Containers...)
+
+	for _, container := range containers {
 		key := pod.Namespace + "/" + pod.Name + "/" + container.Name
 
 		r.mu.Lock()
@@ -230,34 +234,70 @@ func (r *logsReceiver) onPodDeleted(pod *corev1.Pod) {
 	}
 
 	r.mu.Lock()
-	for _, container := range pod.Spec.Containers {
+	for _, container := range append(append([]corev1.Container(nil), pod.Spec.InitContainers...), pod.Spec.Containers...) {
 		key := pod.Namespace + "/" + pod.Name + "/" + container.Name
 		if cancel, ok := r.activeStreams[key]; ok {
 			cancel()
 			delete(r.activeStreams, key)
 		}
+		delete(r.terminatedContainers, key)
 	}
-	delete(r.terminatedPods, pod.Namespace+"/"+pod.Name)
 	r.mu.Unlock()
 
 	r.recordActiveStreams(ctx)
 }
 
-func (r *logsReceiver) markPodPhase(pod *corev1.Pod) {
-	if pod.Status.Phase != corev1.PodSucceeded && pod.Status.Phase != corev1.PodFailed {
-		return
-	}
+func (r *logsReceiver) markContainerStates(pod *corev1.Pod) {
 	r.mu.Lock()
-	if r.terminatedPods == nil {
-		r.terminatedPods = make(map[string]struct{})
+	defer r.mu.Unlock()
+	if r.terminatedContainers == nil {
+		r.terminatedContainers = make(map[string]struct{})
 	}
-	r.terminatedPods[pod.Namespace+"/"+pod.Name] = struct{}{}
-	r.mu.Unlock()
+	for _, cs := range pod.Status.ContainerStatuses {
+		if containerIsTerminal(pod.Spec.RestartPolicy, cs, false, nil) {
+			r.terminatedContainers[pod.Namespace+"/"+pod.Name+"/"+cs.Name] = struct{}{}
+		}
+	}
+	for _, cs := range pod.Status.InitContainerStatuses {
+		if containerIsTerminal(pod.Spec.RestartPolicy, cs, true, initContainerRestartPolicy(pod, cs.Name)) {
+			r.terminatedContainers[pod.Namespace+"/"+pod.Name+"/"+cs.Name] = struct{}{}
+		}
+	}
 }
 
-func (r *logsReceiver) isPodTerminal(namespace, podName string) bool {
+func containerIsTerminal(podPolicy corev1.RestartPolicy, cs corev1.ContainerStatus, isInit bool, ownPolicy *corev1.ContainerRestartPolicy) bool {
+	term := cs.State.Terminated
+	if term == nil {
+		return false
+	}
+	if ownPolicy != nil && *ownPolicy == corev1.ContainerRestartPolicyAlways {
+		return false
+	}
+	if isInit {
+		return term.ExitCode == 0 || podPolicy == corev1.RestartPolicyNever
+	}
+	switch podPolicy {
+	case corev1.RestartPolicyNever:
+		return true
+	case corev1.RestartPolicyOnFailure:
+		return term.ExitCode == 0
+	default:
+		return false
+	}
+}
+
+func initContainerRestartPolicy(pod *corev1.Pod, name string) *corev1.ContainerRestartPolicy {
+	for i := range pod.Spec.InitContainers {
+		if pod.Spec.InitContainers[i].Name == name {
+			return pod.Spec.InitContainers[i].RestartPolicy
+		}
+	}
+	return nil
+}
+
+func (r *logsReceiver) isContainerTerminal(key string) bool {
 	r.mu.Lock()
-	_, terminal := r.terminatedPods[namespace+"/"+podName]
+	_, terminal := r.terminatedContainers[key]
 	r.mu.Unlock()
 	return terminal
 }
@@ -365,7 +405,7 @@ func (r *logsReceiver) streamContainerLogs(ctx context.Context, namespace, podNa
 			sinceTime = &t
 		}
 
-		if r.isPodTerminal(namespace, podName) {
+		if r.isContainerTerminal(key) {
 			if scanErr != nil {
 				r.drainTerminalLogs(ctx, logline.Meta{
 					Namespace:     namespace,
@@ -374,7 +414,7 @@ func (r *logsReceiver) streamContainerLogs(ctx context.Context, namespace, podNa
 					ContainerName: containerName,
 				}, &lastSeenTimestamp, logger)
 			}
-			logger.Debug("pod is in a terminal phase, stopping log stream")
+			logger.Debug("container terminated, stopping log stream")
 			return
 		}
 
@@ -409,7 +449,7 @@ func (r *logsReceiver) drainTerminalLogs(ctx context.Context, m logline.Meta, la
 	}
 }
 
-func (r *logsReceiver) streamConnection(_ context.Context, stream io.Reader, m logline.Meta) (lastTS time.Time, scanErr error) {
+func (r *logsReceiver) streamConnection(ctx context.Context, stream io.Reader, m logline.Meta) (lastTS time.Time, scanErr error) {
 	maxBatch := r.batchSize()
 	flushInterval := r.flushInterval()
 
@@ -443,7 +483,7 @@ func (r *logsReceiver) streamConnection(_ context.Context, stream io.Reader, m l
 		if batch.Count() == 0 {
 			return
 		}
-		if r.consumeBatch(batch.Logs(), batch.Count()) && !batchMaxTS.IsZero() {
+		if r.consumeBatch(ctx, batch.Logs(), batch.Count()) && !batchMaxTS.IsZero() {
 			lastTS = batchMaxTS
 		}
 		batch = logline.NewBatch(m)
@@ -472,8 +512,8 @@ func (r *logsReceiver) streamConnection(_ context.Context, stream io.Reader, m l
 	}
 }
 
-func (r *logsReceiver) consumeBatch(logs plog.Logs, count int) bool {
-	consumeCtx := context.Background()
+func (r *logsReceiver) consumeBatch(ctx context.Context, logs plog.Logs, count int) bool {
+	consumeCtx := ctx
 	if r.obsrep != nil {
 		consumeCtx = r.obsrep.StartLogsOp(consumeCtx)
 	}
@@ -488,7 +528,7 @@ func (r *logsReceiver) consumeBatch(logs plog.Logs, count int) bool {
 	return true
 }
 
-func (r *logsReceiver) emitLogLine(namespace, podName, podUID, containerName, line string, ts time.Time) {
+func (r *logsReceiver) emitLogLine(ctx context.Context, namespace, podName, podUID, containerName, line string, ts time.Time) {
 	b := logline.NewBatch(logline.Meta{
 		Namespace:     namespace,
 		PodName:       podName,
@@ -496,7 +536,7 @@ func (r *logsReceiver) emitLogLine(namespace, podName, podUID, containerName, li
 		ContainerName: containerName,
 	})
 	b.Append(line, ts)
-	r.consumeBatch(b.Logs(), b.Count())
+	r.consumeBatch(ctx, b.Logs(), b.Count())
 }
 
 func (r *logsReceiver) batchSize() int {

@@ -46,7 +46,7 @@ but the issue was closed as inactive.
 
 ## Intentional scope
 
-This receiver collects **application container logs only** — what a pod writes to stdout/stderr. It does not and cannot collect:
+This receiver collects **application container logs only** — what a pod writes to stdout/stderr. It streams every container in a discovered pod: regular containers, init containers (migrations, secret fetchers), and native sidecars (init containers with `restartPolicy: Always`). It does not and cannot collect:
 
 - Node logs (systemd journal, kubelet, containerd daemon logs) — these live on the host filesystem and require hostPath access
 - Control plane logs (kube-apiserver, etcd, scheduler)
@@ -174,8 +174,16 @@ receivers:
   single stream through an unbroken run of failures: once it is exceeded the
   receiver gives up on that stream (a successful reconnect resets the clock).
   Set `max_elapsed_time: 0` to retry indefinitely. Independently of backoff, a
-  stream is always stopped when the pod is deleted or reaches a terminal
-  (`Succeeded`/`Failed`) phase.
+  container's stream is always stopped when the pod is deleted or when that
+  container has permanently terminated — evaluated per container from its own
+  `ContainerStatus`, not from the pod's `Succeeded`/`Failed` phase, so a
+  finished container in a still-`Running` pod (e.g. one container of a
+  multi-container `Job` with `restartPolicy: Never`) stops reconnecting
+  immediately instead of hammering the API server. The check is restart-policy
+  aware: a CrashLooping container (`restartPolicy: Always`), an `OnFailure`
+  container that exited non-zero, and native sidecars (init containers with
+  `restartPolicy: Always`) are not treated as terminal, so their streams keep
+  following restarts.
 - `max_batch_size` (default `1000`, `0` means use the default): the maximum
   number of log lines coalesced into a single `plog.Logs` / `ConsumeLogs` push
   per container stream. Each container's log stream is read independently and

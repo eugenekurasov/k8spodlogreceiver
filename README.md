@@ -299,6 +299,12 @@ and retry.
   kubelet's retained rotated logs, some lines are unrecoverable. A
   hostPath-based collector doesn't have this limitation. Worth
   documenting as an explicit trade-off, not solving away.
+- **Previous container instance logs not recovered on restart**: when a
+  container restarts, logs from its prior instance are not backfilled —
+  the receiver only streams the current instance and does not use the
+  kubelet's `previous` log endpoint (`GET .../log?previous=true`). Any
+  lines emitted by the crashed/restarted instance before the new stream
+  attaches are lost.
 - **Multiline / structured parsing**: this skeleton emits one log record
   per line with no stack-trace/multiline joining. Would need a
   stanza-based parsing operator pipeline, similar to `filelogreceiver`,

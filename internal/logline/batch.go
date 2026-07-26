@@ -40,9 +40,11 @@ func NewBatch(m Meta) *Batch {
 
 func (b *Batch) Append(body string, ts time.Time) {
 	lr := b.records.AppendEmpty()
+	now := time.Now()
 	if ts.IsZero() {
-		ts = time.Now()
+		ts = now
 	}
+	lr.SetObservedTimestamp(pcommon.NewTimestampFromTime(now))
 	lr.SetTimestamp(pcommon.NewTimestampFromTime(ts))
 	lr.Body().SetStr(body)
 	b.count++

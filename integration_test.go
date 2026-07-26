@@ -158,3 +158,86 @@ func TestIntegration_LogsArrive(t *testing.T) {
 	}, integrationTimeout, 500*time.Millisecond,
 		"log record with marker %q never arrived — check receiver logs for stream errors", integrationMarker)
 }
+
+// startReceiver builds and starts the receiver with cfg against the ambient
+// cluster (KUBECONFIG in CI, ~/.kube/config locally), returning a sink and a
+// shutdown func. If the cluster is unreachable the test is skipped rather than
+// failed, so `go test -tags integration` without a cluster is a no-op locally.
+func startReceiver(t *testing.T, cfg *Config) (*consumertest.LogsSink, func()) {
+	t.Helper()
+	factory := NewFactory()
+	sink := &consumertest.LogsSink{}
+	recv, err := factory.CreateLogs(
+		context.Background(),
+		receivertest.NewNopSettings(factory.Type()),
+		cfg,
+		sink,
+	)
+	require.NoError(t, err)
+
+	if err := recv.Start(context.Background(), componenttest.NewNopHost()); err != nil {
+		t.Skipf("cluster unreachable, skipping test: %v", err)
+	}
+	return sink, func() {
+		assert.NoError(t, recv.Shutdown(context.Background()))
+	}
+}
+
+// baseConfig returns a default receiver Config authenticating via the ambient
+// kubeconfig (kind sets it in CI). SinceSeconds is left nil (full available
+// history) so a long-running pod's already-written logs are still read even if
+// the stream attaches after the line was written.
+func baseConfig() *Config {
+	factory := NewFactory()
+	cfg := factory.CreateDefaultConfig().(*Config)
+	cfg.APIConfig.AuthType = AuthTypeKubeConfig
+	return cfg
+}
+
+// TestIntegration_NamespaceFilter asserts the receiver only streams logs from
+// the configured namespace. kube-system always has running pods on a kind
+// cluster, so it is a reliable source of real log traffic.
+func TestIntegration_NamespaceFilter(t *testing.T) {
+	cfg := baseConfig()
+	cfg.Namespaces = []string{"kube-system"}
+
+	sink, shutdown := startReceiver(t, cfg)
+	defer shutdown()
+
+	require.Eventually(t, func() bool {
+		return sink.LogRecordCount() > 0
+	}, integrationTimeout, 500*time.Millisecond, "no log records received from kube-system")
+
+	for _, ld := range sink.AllLogs() {
+		for i := 0; i < ld.ResourceLogs().Len(); i++ {
+			ns, _ := ld.ResourceLogs().At(i).Resource().Attributes().Get("k8s.namespace.name")
+			assert.Equal(t, "kube-system", ns.Str(), "namespace filter leaked logs from another namespace")
+		}
+	}
+}
+
+// TestIntegration_Shutdown verifies Shutdown returns promptly once log streams
+// are active. Combined with goleak.VerifyTestMain (generated_package_test.go),
+// this exercises full lifecycle teardown on a live cluster and fails the run on
+// any leaked goroutine — across all k8s versions in the integration matrix.
+func TestIntegration_Shutdown(t *testing.T) {
+	sink, shutdown := startReceiver(t, baseConfig())
+
+	// Wait for at least one stream to become active before shutting down.
+	require.Eventually(t, func() bool {
+		return sink.LogRecordCount() > 0
+	}, integrationTimeout, 500*time.Millisecond, "no streams became active before shutdown test")
+
+	done := make(chan struct{})
+	go func() {
+		shutdown()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		// clean shutdown
+	case <-time.After(10 * time.Second):
+		t.Fatal("Shutdown did not return within 10s — possible goroutine leak")
+	}
+}

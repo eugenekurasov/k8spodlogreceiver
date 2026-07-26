@@ -54,13 +54,14 @@ This receiver collects **application container logs only** — what a pod writes
 
 This is a deliberate scope choice. The target user is a **tenant team** that wants full visibility into their own application pods without any node-level privilege granted. If node-level log collection is required, it belongs in a separate cluster-operator-managed pipeline with explicitly granted node access — not mixed into per-tenant collectors.
 
-## Compliance / multi-tenancy fit
+## Multi-tenancy fit
 
-Because access is mediated entirely by the Kubernetes API and scoped via
-RBAC, a single cluster can run per-tenant collector instances that are
-only authorized to read logs for their own namespace(s) — useful for
-environments with SOC 2-style log-access segregation
-requirements, without relying on node-level trust boundaries.
+Because access is mediated entirely by the Kubernetes API and scoped by RBAC, a
+single cluster can run per-tenant collector instances that are authorized to
+read logs only for their own namespace(s). The boundary is enforced by the API
+server rather than by a trusted node-level agent, so log-access segregation
+between tenants is an RBAC object that can be inspected and audited, not a
+configuration convention.
 
 ## Quick start
 
@@ -300,11 +301,16 @@ and retry.
   hostPath-based collector doesn't have this limitation. Worth
   documenting as an explicit trade-off, not solving away.
 - **Previous container instance logs not recovered on restart**: when a
-  container restarts, logs from its prior instance are not backfilled —
-  the receiver only streams the current instance and does not use the
-  kubelet's `previous` log endpoint (`GET .../log?previous=true`). Any
-  lines emitted by the crashed/restarted instance before the new stream
-  attaches are lost.
+  container restarts, logs from its prior instance are not backfilled. The
+  receiver streams only the current instance — it does not set
+  `Previous: true` in `PodLogOptions`, so it never requests the
+  `?previous=true` variant of the API server's pod log endpoint. Any lines
+  emitted by the crashed instance before the new stream attaches are lost.
+- **No cursor persistence across restarts**: reconnect position is held in
+memory (bounded by `since_seconds`); after a collector restart, history is
+  re-read within that window (possible duplicates) or lost beyond it. There
+  is no persistent checkpoint equivalent to `filelogreceiver`'s file offset
+  storage.
 - **Multiline / structured parsing**: this skeleton emits one log record
   per line with no stack-trace/multiline joining. Would need a
   stanza-based parsing operator pipeline, similar to `filelogreceiver`,
@@ -318,8 +324,21 @@ and retry.
 
 ## Relation to the broader security-observability-stack project
 
-This receiver is one component of a larger effort
-(`../../helm`) to package a compliance-oriented,
-multi-tenant observability stack (OTel Collector → Prometheus →
-backend) with sane defaults for regulated environments. See
+This receiver is one component of a larger project (`../../helm`) that packages
+an OTel Collector deployment — receivers, RBAC, and optional per-namespace
+scoping — for Kubernetes clusters. See
 [`../../docs/architecture.md`](../../docs/architecture.md).
+
+## Third-party code
+
+`internal/watch` is copied, with adaptations, from
+[`internal/k8sinventory/watch`](https://github.com/open-telemetry/opentelemetry-collector-contrib/blob/main/internal/k8sinventory/watch/observer.go)
+in `opentelemetry-collector-contrib` (Copyright The OpenTelemetry Authors,
+licensed Apache-2.0). That package lives under an `internal/` path, so Go's
+package visibility rules allow it to be imported only from within the contrib
+module tree — it is redistributed here with attribution rather than
+reimplemented, as Apache-2.0 permits. The same attribution appears in the file
+header of [`internal/watch/observer.go`](internal/watch/observer.go).
+
+All other code in this directory is original to this repository and licensed
+under [Apache-2.0](../../LICENSE).

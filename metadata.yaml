@@ -6,7 +6,7 @@ status:
   class: receiver
   stability:
     development: [logs]
-  distributions: [k8s]
+  distributions: []
   codeowners:
     active: [eugenekurasov]
 

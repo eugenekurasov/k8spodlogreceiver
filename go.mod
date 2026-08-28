@@ -36,6 +36,7 @@ require (
 )
 
 require (
+	github.com/cenkalti/backoff/v4 v4.3.0
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
 	github.com/davecgh/go-spew v1.1.2-0.20180830191138-d8f796af33cc // indirect
 	github.com/emicklei/go-restful/v3 v3.13.0 // indirect
@@ -74,7 +75,7 @@ require (
 	github.com/spf13/pflag v1.0.10 // indirect
 	github.com/x448/float16 v0.8.4 // indirect
 	go.opentelemetry.io/auto/sdk v1.2.1 // indirect
-	go.opentelemetry.io/collector/consumer/consumererror v0.156.0 // indirect
+	go.opentelemetry.io/collector/consumer/consumererror v0.156.0
 	go.opentelemetry.io/collector/consumer/xconsumer v0.156.0 // indirect
 	go.opentelemetry.io/collector/featuregate v1.62.0 // indirect
 	go.opentelemetry.io/collector/internal/componentalias v0.156.0 // indirect

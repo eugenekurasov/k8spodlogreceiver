@@ -11,6 +11,7 @@ import (
 
 	"go.opentelemetry.io/collector/component"
 
+	"github.com/eugenekurasov/security-observability-stack/otel-components/k8spodlogreceiver/internal/consumerretry"
 	"github.com/eugenekurasov/security-observability-stack/otel-components/k8spodlogreceiver/internal/k8sconfig"
 	"github.com/eugenekurasov/security-observability-stack/otel-components/k8spodlogreceiver/internal/logline"
 )
@@ -46,6 +47,13 @@ type Config struct {
 	// stream from the kubelet is interrupted (rotation, pod restart,
 	// transient API server errors).
 	ReconnectBackoff ReconnectBackoffConfig `mapstructure:"reconnect_backoff"`
+
+	// RetryOnFailure controls what happens when the pipeline refuses a batch
+	// with a recoverable error — most commonly memory_limiter shedding load.
+	// Enabled (the default), a refused batch is retried with backoff instead
+	// of being dropped, which also applies backpressure to the kubelet stream.
+	// See consumerretry.go for why refusals must not be treated as failures.
+	RetryOnFailure RetryOnFailureConfig `mapstructure:"retry_on_failure"`
 
 	// MaxBatchSize is the maximum number of log records coalesced into a
 	// single plog.Logs / ConsumeLogs call per container stream. A container
@@ -122,6 +130,13 @@ type ReconnectBackoffConfig struct {
 	MaxElapsedTime  time.Duration `mapstructure:"max_elapsed_time"`
 }
 
+// RetryOnFailureConfig configures retrying batches the pipeline refuses with a
+// recoverable error. Alias (not a new type) for consumerretry.Config, whose
+// fields carry the mapstructure tags that make up this section's user-facing
+// schema — see internal/consumerretry for the field docs, the divergences from
+// contrib's original, and where this is applied.
+type RetryOnFailureConfig = consumerretry.Config
+
 var (
 	errNoRBACHint = errors.New(
 		"k8spodlogreceiver: ensure the ServiceAccount has RBAC permission " +
@@ -143,6 +158,9 @@ func (cfg *Config) Validate() error {
 	}
 	if cfg.ReconnectBackoff.MaxElapsedTime < 0 {
 		return errors.New("k8spodlogreceiver: reconnect_backoff.max_elapsed_time must be >= 0")
+	}
+	if err := cfg.RetryOnFailure.Validate(); err != nil {
+		return fmt.Errorf("k8spodlogreceiver: %w", err)
 	}
 	if cfg.MaxBatchSize < 0 {
 		return errors.New("k8spodlogreceiver: max_batch_size must be >= 0")

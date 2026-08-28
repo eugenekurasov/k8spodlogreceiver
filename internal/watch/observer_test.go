@@ -8,21 +8,25 @@
 //
 // The checkpointer/storage-persistence tests were dropped because this copy
 // removed the upstream checkpointer (see observer.go header). Config no longer
-// embeds k8sinventory.Config (fields are flattened here), New no longer takes a
-// storage.Client, and sendInitialState/getResourceVersion lost their
-// checkpointer-only parameters — the tests below track those signatures.
+// embeds k8sinventory.Config (fields are flattened here; the unused
+// IncludeInitialState / ResourceVersion / FieldSelector knobs were removed
+// along with getResourceVersion and its tests), New no longer takes a
+// storage.Client and returns no error — the tests below track those
+// signatures. The initial state is always emitted now, so event counts
+// include pods that exist before Start.
 
 package watch // import "github.com/eugenekurasov/security-observability-stack/otel-components/k8spodlogreceiver/internal/watch"
 
 import (
 	"context"
 	"errors"
+	"net/http"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
 	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -51,13 +55,14 @@ func TestObserver(t *testing.T) {
 		Namespaces: []string{"default"},
 	}
 
-	receivedEventsChan := make(chan *apiWatch.Event)
+	// Buffered: the always-on initial state emits pod1 before this test
+	// starts draining, and an unbuffered send would stall the observer so the
+	// watch would only register after createPods below (losing those events).
+	receivedEventsChan := make(chan *apiWatch.Event, 10)
 
-	obs, err := New(mockClient, cfg, zap.NewNop(), func(event *apiWatch.Event) {
+	obs := New(mockClient, cfg, zap.NewNop(), func(event *apiWatch.Event) {
 		receivedEventsChan <- event
 	})
-
-	require.NoError(t, err)
 
 	wg := sync.WaitGroup{}
 
@@ -77,7 +82,10 @@ func TestObserver(t *testing.T) {
 		}, "4"),
 	)
 
-	verifyReceivedEvents(t, 2, receivedEventsChan, stopChan)
+	// pod1 existed before Start, so the always-on initial state adds one
+	// synthetic Added on top of the two watch events (pod3 is in an
+	// unwatched namespace).
+	verifyReceivedEvents(t, 3, receivedEventsChan, stopChan)
 
 	wg.Wait()
 }
@@ -96,17 +104,14 @@ func TestObserverWithInitialState(t *testing.T) {
 			Version:  "v1",
 			Resource: "pods",
 		},
-		Namespaces:          []string{"default"},
-		IncludeInitialState: true,
+		Namespaces: []string{"default"},
 	}
 
 	receivedEventsChan := make(chan *apiWatch.Event)
 
-	obs, err := New(mockClient, cfg, zap.NewNop(), func(event *apiWatch.Event) {
+	obs := New(mockClient, cfg, zap.NewNop(), func(event *apiWatch.Event) {
 		receivedEventsChan <- event
 	})
-
-	require.NoError(t, err)
 
 	wg := sync.WaitGroup{}
 
@@ -126,8 +131,7 @@ func TestObserverExcludeDelete(t *testing.T) {
 			Version:  "v1",
 			Resource: "pods",
 		},
-		Namespaces:          []string{"default"},
-		IncludeInitialState: true,
+		Namespaces: []string{"default"},
 		Exclude: map[apiWatch.EventType]bool{
 			apiWatch.Deleted: true,
 		},
@@ -135,11 +139,9 @@ func TestObserverExcludeDelete(t *testing.T) {
 
 	receivedEventsChan := make(chan *apiWatch.Event)
 
-	obs, err := New(mockClient, cfg, zap.NewNop(), func(event *apiWatch.Event) {
+	obs := New(mockClient, cfg, zap.NewNop(), func(event *apiWatch.Event) {
 		receivedEventsChan <- event
 	})
-
-	require.NoError(t, err)
 
 	wg := sync.WaitGroup{}
 
@@ -174,11 +176,9 @@ func TestObserverEmptyNamespaces(t *testing.T) {
 
 	receivedEventsChan := make(chan *apiWatch.Event)
 
-	obs, err := New(mockClient, cfg, zap.NewNop(), func(event *apiWatch.Event) {
+	obs := New(mockClient, cfg, zap.NewNop(), func(event *apiWatch.Event) {
 		receivedEventsChan <- event
 	})
-
-	require.NoError(t, err)
 
 	wg := sync.WaitGroup{}
 
@@ -210,11 +210,9 @@ func TestObserverMultipleNamespaces(t *testing.T) {
 
 	receivedEventsChan := make(chan *apiWatch.Event)
 
-	obs, err := New(mockClient, cfg, zap.NewNop(), func(event *apiWatch.Event) {
+	obs := New(mockClient, cfg, zap.NewNop(), func(event *apiWatch.Event) {
 		receivedEventsChan <- event
 	})
-
-	require.NoError(t, err)
 
 	wg := sync.WaitGroup{}
 
@@ -242,19 +240,15 @@ func TestObserverWithSelectors(t *testing.T) {
 			Version:  "v1",
 			Resource: "pods",
 		},
-		Namespaces:      []string{"default"},
-		LabelSelector:   "environment=test",
-		FieldSelector:   "",
-		ResourceVersion: "",
+		Namespaces:    []string{"default"},
+		LabelSelector: "environment=test",
 	}
 
 	receivedEventsChan := make(chan *apiWatch.Event)
 
-	obs, err := New(mockClient, cfg, zap.NewNop(), func(event *apiWatch.Event) {
+	obs := New(mockClient, cfg, zap.NewNop(), func(event *apiWatch.Event) {
 		receivedEventsChan <- event
 	})
-
-	require.NoError(t, err)
 
 	wg := sync.WaitGroup{}
 
@@ -287,22 +281,19 @@ func TestObserverInitialStateError(t *testing.T) {
 			Version:  "v1",
 			Resource: "pods",
 		},
-		Namespaces:          []string{"default"},
-		IncludeInitialState: true,
+		Namespaces: []string{"default"},
 	}
 
 	receivedEventsChan := make(chan *apiWatch.Event)
 
-	obs, err := New(mockClient, cfg, zap.NewNop(), func(event *apiWatch.Event) {
+	obs := New(mockClient, cfg, zap.NewNop(), func(event *apiWatch.Event) {
 		receivedEventsChan <- event
 	})
-
-	require.NoError(t, err)
 
 	wg := sync.WaitGroup{}
 
 	// Unlike contrib (which cancels and gives up on a List error), this copy
-	// backs off and retries getResourceVersion indefinitely. That retry loop is
+	// backs off and retries the state re-List indefinitely. That retry loop is
 	// upstream of doWatch, so closing stopChan can't interrupt it — the only way
 	// to stop the observer here is to cancel its context.
 	ctx, cancel := context.WithCancel(t.Context())
@@ -333,17 +324,14 @@ func TestObserverInitialStateNoObjects(t *testing.T) {
 			Version:  "v1",
 			Resource: "pods",
 		},
-		Namespaces:          []string{"default"},
-		IncludeInitialState: true,
+		Namespaces: []string{"default"},
 	}
 
 	receivedEventsChan := make(chan *apiWatch.Event)
 
-	obs, err := New(mockClient, cfg, zap.NewNop(), func(event *apiWatch.Event) {
+	obs := New(mockClient, cfg, zap.NewNop(), func(event *apiWatch.Event) {
 		receivedEventsChan <- event
 	})
-
-	require.NoError(t, err)
 
 	wg := sync.WaitGroup{}
 
@@ -368,6 +356,55 @@ func TestObserverInitialStateNoObjects(t *testing.T) {
 // list's own ResourceVersion, not just the highest individual object RV.
 // The list RV is always >= any individual object RV and is the correct starting
 // point for the subsequent watch to avoid a race window between two List calls.
+// TestObserverReplaysInitialStateAfter410 guards the divergence from contrib
+// documented in the observer.go header: after a 410 Gone the observer must
+// re-emit the current state as synthetic Added events, not just resume the
+// watch from a fresh resourceVersion. A pod created during the blind window
+// only surfaces through that replay.
+func TestObserverReplaysInitialStateAfter410(t *testing.T) {
+	mockClient := newMockDynamicClient()
+	mockClient.createPods(generatePod("pod1", "default", nil, "1"))
+
+	// The first watch attempt delivers a 410 Gone error event; later attempts
+	// fall through to the fake's default watch reactor.
+	var watchCalls atomic.Int32
+	mockClient.client.(*fake.FakeDynamicClient).PrependWatchReactor("pods", func(_ k8s_testing.Action) (bool, apiWatch.Interface, error) {
+		if watchCalls.Add(1) > 1 {
+			return false, nil, nil
+		}
+		fw := apiWatch.NewRaceFreeFake()
+		fw.Error(&v1.Status{Code: http.StatusGone, Reason: v1.StatusReasonGone})
+		return true, fw, nil
+	})
+
+	cfg := Config{
+		Gvr:        schema.GroupVersionResource{Group: "", Version: "v1", Resource: "pods"},
+		Namespaces: []string{"default"},
+	}
+
+	receivedEventsChan := make(chan *apiWatch.Event, 10)
+	obs := New(mockClient, cfg, zap.NewNop(), func(event *apiWatch.Event) {
+		receivedEventsChan <- event
+	})
+
+	wg := sync.WaitGroup{}
+	stopChan := obs.Start(t.Context(), &wg)
+
+	// Two Added events for the same pod: the initial state, then the replay
+	// forced by the 410.
+	for i := 0; i < 2; i++ {
+		select {
+		case ev := <-receivedEventsChan:
+			assert.Equal(t, apiWatch.Added, ev.Type)
+		case <-time.After(10 * time.Second):
+			t.Fatalf("timed out waiting for event %d", i+1)
+		}
+	}
+
+	close(stopChan)
+	wg.Wait()
+}
+
 func TestSendInitialStateReturnsListRV(t *testing.T) {
 	mockClient := newMockDynamicClient()
 	// Set list RV to "999", higher than any individual object RV below.
@@ -378,13 +415,11 @@ func TestSendInitialStateReturnsListRV(t *testing.T) {
 	)
 
 	cfg := Config{
-		Gvr:                 schema.GroupVersionResource{Group: "", Version: "v1", Resource: "pods"},
-		Namespaces:          []string{"default"},
-		IncludeInitialState: true,
+		Gvr:        schema.GroupVersionResource{Group: "", Version: "v1", Resource: "pods"},
+		Namespaces: []string{"default"},
 	}
 
-	obs, err := New(mockClient, cfg, zap.NewNop(), nil)
-	require.NoError(t, err)
+	obs := New(mockClient, cfg, zap.NewNop(), nil)
 
 	resource := mockClient.Resource(cfg.Gvr)
 	listRV := obs.sendInitialState(t.Context(), resource.Namespace("default"), "default")
@@ -545,100 +580,4 @@ func generatePod(name, namespace string, labels map[string]any, resourceVersion 
 
 	pod.SetResourceVersion(resourceVersion)
 	return &pod
-}
-
-func TestGetResourceVersion(t *testing.T) {
-	// The checkpointer/persistence source was removed in this copy, so only the
-	// config-resource-version and list-derived paths remain.
-
-	t.Run("with config resource version", func(t *testing.T) {
-		tests := []struct {
-			name            string
-			configVersion   string
-			listVersion     string
-			expectedVersion string
-		}{
-			{
-				name:            "config RV set - use it",
-				configVersion:   "150",
-				listVersion:     "100",
-				expectedVersion: "150",
-			},
-			{
-				name:            "config RV is zero - fall back to list",
-				configVersion:   "0",
-				listVersion:     "100",
-				expectedVersion: "100",
-			},
-		}
-
-		for _, tt := range tests {
-			t.Run(tt.name, func(t *testing.T) {
-				mockClient := newMockDynamicClient()
-				if tt.listVersion != "" {
-					mockClient.setListResourceVersion(tt.listVersion)
-				}
-
-				cfg := Config{
-					Gvr:             schema.GroupVersionResource{Group: "", Version: "v1", Resource: "pods"},
-					Namespaces:      []string{"default"},
-					ResourceVersion: tt.configVersion,
-				}
-
-				obs, err := New(mockClient, cfg, zap.NewNop(), nil)
-				require.NoError(t, err)
-
-				resource := mockClient.Resource(cfg.Gvr)
-				version, err := obs.getResourceVersion(t.Context(), resource.Namespace("default"))
-				require.NoError(t, err)
-				assert.Equal(t, tt.expectedVersion, version)
-			})
-		}
-	})
-
-	t.Run("from list (no config)", func(t *testing.T) {
-		tests := []struct {
-			name            string
-			listVersion     string
-			expectedVersion string
-		}{
-			{
-				name:            "list version returned",
-				listVersion:     "100",
-				expectedVersion: "100",
-			},
-			{
-				name:            "empty list version - use default",
-				listVersion:     "",
-				expectedVersion: "1",
-			},
-			{
-				name:            "zero list version - use default",
-				listVersion:     "0",
-				expectedVersion: "1",
-			},
-		}
-
-		for _, tt := range tests {
-			t.Run(tt.name, func(t *testing.T) {
-				mockClient := newMockDynamicClient()
-				if tt.listVersion != "" {
-					mockClient.setListResourceVersion(tt.listVersion)
-				}
-
-				cfg := Config{
-					Gvr:        schema.GroupVersionResource{Group: "", Version: "v1", Resource: "pods"},
-					Namespaces: []string{"default"},
-				}
-
-				obs, err := New(mockClient, cfg, zap.NewNop(), nil)
-				require.NoError(t, err)
-
-				resource := mockClient.Resource(cfg.Gvr)
-				version, err := obs.getResourceVersion(t.Context(), resource.Namespace("default"))
-				require.NoError(t, err)
-				assert.Equal(t, tt.expectedVersion, version)
-			})
-		}
-	})
 }

@@ -2,6 +2,7 @@ package k8spodlogreceiver
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -19,7 +20,6 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -29,10 +29,10 @@ import (
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 
+	"github.com/eugenekurasov/security-observability-stack/otel-components/k8spodlogreceiver/internal/consumerretry"
 	"github.com/eugenekurasov/security-observability-stack/otel-components/k8spodlogreceiver/internal/k8sconfig"
 	"github.com/eugenekurasov/security-observability-stack/otel-components/k8spodlogreceiver/internal/logline"
 	"github.com/eugenekurasov/security-observability-stack/otel-components/k8spodlogreceiver/internal/metadata"
-	"github.com/eugenekurasov/security-observability-stack/otel-components/k8spodlogreceiver/internal/retry"
 	"github.com/eugenekurasov/security-observability-stack/otel-components/k8spodlogreceiver/internal/watch"
 )
 
@@ -86,10 +86,12 @@ func newLogsReceiver(settings receiver.Settings, cfg *Config, c consumer.Logs) (
 		return nil, fmt.Errorf("k8spodlogreceiver: building telemetry: %w", err)
 	}
 
+	nextConsumer := consumerretry.NewLogs(cfg.RetryOnFailure, settings.Logger, c)
+
 	r := &logsReceiver{
 		cfg:                  cfg,
 		settings:             settings,
-		consumer:             c,
+		consumer:             nextConsumer,
 		activeStreams:        make(map[string]context.CancelFunc),
 		terminatedContainers: make(map[string]struct{}),
 		obsrep:               obsrep,
@@ -126,10 +128,7 @@ func (r *logsReceiver) Start(ctx context.Context, _ component.Host) error {
 	ctx, cancel := context.WithCancel(ctx)
 	r.cancel = cancel
 
-	if err := r.startPodObserver(ctx); err != nil {
-		return fmt.Errorf("k8spodlogreceiver: starting pod observer: %w", err)
-	}
-
+	r.startPodObserver(ctx)
 	return nil
 }
 
@@ -150,26 +149,21 @@ func (r *logsReceiver) Shutdown(context.Context) error {
 	return nil
 }
 
-func (r *logsReceiver) startPodObserver(ctx context.Context) error {
-	observer, err := watch.New(
+func (r *logsReceiver) startPodObserver(ctx context.Context) {
+	observer := watch.New(
 		r.dynamicClient,
 		watch.Config{
-			Gvr:                 podGVR,
-			Namespaces:          r.cfg.Namespaces,
-			LabelSelector:       r.cfg.PodLabelSelector,
-			IncludeInitialState: true,
+			Gvr:           podGVR,
+			Namespaces:    r.cfg.Namespaces,
+			LabelSelector: r.cfg.PodLabelSelector,
 			// Bookmarks carry only a resourceVersion, no pod payload — drop them.
 			Exclude: map[apiWatch.EventType]bool{apiWatch.Bookmark: true},
 		},
 		r.settings.Logger,
 		func(event *apiWatch.Event) { r.handlePodEvent(ctx, event) },
 	)
-	if err != nil {
-		return err
-	}
 
 	observer.Start(ctx, &r.wg)
-	return nil
 }
 
 func (r *logsReceiver) handlePodEvent(ctx context.Context, event *apiWatch.Event) {
@@ -203,13 +197,48 @@ func (r *logsReceiver) onPodAdded(ctx context.Context, pod *corev1.Pod) {
 	r.ensureStreams(ctx, pod)
 }
 
-func (r *logsReceiver) ensureStreams(ctx context.Context, pod *corev1.Pod) {
+// streamKey identifies one container's log stream in activeStreams and
+// terminatedContainers.
+func streamKey(namespace, podName, containerName string) string {
+	return namespace + "/" + podName + "/" + containerName
+}
+
+// podContainers lists every container the receiver should stream: init
+// containers first, then regular ones.
+func podContainers(pod *corev1.Pod) []corev1.Container {
 	containers := make([]corev1.Container, 0, len(pod.Spec.InitContainers)+len(pod.Spec.Containers))
 	containers = append(containers, pod.Spec.InitContainers...)
-	containers = append(containers, pod.Spec.Containers...)
+	return append(containers, pod.Spec.Containers...)
+}
 
-	for _, container := range containers {
-		key := pod.Namespace + "/" + pod.Name + "/" + container.Name
+// containerHasStarted reports whether a container has ever started — i.e.
+// whether the kubelet can have logs for it. Streaming a container that is
+// still waiting (ContainerCreating, image pull) would only churn through
+// "is waiting to start" connect errors, so ensureStreams skips it; the
+// Modified event emitted when it starts running picks it up.
+func containerHasStarted(pod *corev1.Pod, name string) bool {
+	for _, statuses := range [][]corev1.ContainerStatus{pod.Status.ContainerStatuses, pod.Status.InitContainerStatuses} {
+		for i := range statuses {
+			cs := &statuses[i]
+			if cs.Name != name {
+				continue
+			}
+			// LastTerminationState covers a restarting container (e.g.
+			// CrashLoopBackOff): currently Waiting, but a previous run left
+			// logs worth reading.
+			return cs.State.Running != nil || cs.State.Terminated != nil ||
+				cs.LastTerminationState.Terminated != nil
+		}
+	}
+	return false
+}
+
+func (r *logsReceiver) ensureStreams(ctx context.Context, pod *corev1.Pod) {
+	for _, container := range podContainers(pod) {
+		if !containerHasStarted(pod, container.Name) {
+			continue
+		}
+		key := streamKey(pod.Namespace, pod.Name, container.Name)
 
 		r.mu.Lock()
 		if _, exists := r.activeStreams[key]; exists {
@@ -234,8 +263,8 @@ func (r *logsReceiver) onPodDeleted(pod *corev1.Pod) {
 	}
 
 	r.mu.Lock()
-	for _, container := range append(append([]corev1.Container(nil), pod.Spec.InitContainers...), pod.Spec.Containers...) {
-		key := pod.Namespace + "/" + pod.Name + "/" + container.Name
+	for _, container := range podContainers(pod) {
+		key := streamKey(pod.Namespace, pod.Name, container.Name)
 		if cancel, ok := r.activeStreams[key]; ok {
 			cancel()
 			delete(r.activeStreams, key)
@@ -250,17 +279,14 @@ func (r *logsReceiver) onPodDeleted(pod *corev1.Pod) {
 func (r *logsReceiver) markContainerStates(pod *corev1.Pod) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if r.terminatedContainers == nil {
-		r.terminatedContainers = make(map[string]struct{})
-	}
 	for _, cs := range pod.Status.ContainerStatuses {
 		if containerIsTerminal(pod.Spec.RestartPolicy, cs, false, nil) {
-			r.terminatedContainers[pod.Namespace+"/"+pod.Name+"/"+cs.Name] = struct{}{}
+			r.terminatedContainers[streamKey(pod.Namespace, pod.Name, cs.Name)] = struct{}{}
 		}
 	}
 	for _, cs := range pod.Status.InitContainerStatuses {
 		if containerIsTerminal(pod.Spec.RestartPolicy, cs, true, initContainerRestartPolicy(pod, cs.Name)) {
-			r.terminatedContainers[pod.Namespace+"/"+pod.Name+"/"+cs.Name] = struct{}{}
+			r.terminatedContainers[streamKey(pod.Namespace, pod.Name, cs.Name)] = struct{}{}
 		}
 	}
 }
@@ -312,7 +338,6 @@ func (r *logsReceiver) recordActiveStreams(ctx context.Context) {
 	r.telemetry.ActiveLogStreams.Record(ctx, count)
 }
 
-// Refactoring needed
 func (r *logsReceiver) streamContainerLogs(ctx context.Context, namespace, podName, podUID, containerName, key string) {
 	defer r.wg.Done()
 	defer func() {
@@ -321,135 +346,39 @@ func (r *logsReceiver) streamContainerLogs(ctx context.Context, namespace, podNa
 		r.mu.Unlock()
 	}()
 
-	logger := r.settings.Logger.With(
-		zap.String("namespace", namespace),
-		zap.String("pod", podName),
-		zap.String("container", containerName),
-		zap.String("podUID", podUID),
-	)
+	r.newContainerStream(namespace, podName, podUID, containerName, key).run(ctx)
+}
 
-	backoff := r.cfg.ReconnectBackoff.InitialInterval
-	sinceSeconds := r.cfg.SinceSeconds
-	var sinceTime *metav1.Time
-	var lastSeenTimestamp time.Time
-	var reconnectStartTime time.Time
-	firstAttempt := true
-
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		default:
-		}
-
-		if !firstAttempt && r.telemetry != nil {
-			r.telemetry.LogConnectionReconnectsTotal.Add(ctx, 1)
-		}
-		firstAttempt = false
-
-		opts := &corev1.PodLogOptions{
-			Container:  containerName,
-			Follow:     true,
-			Timestamps: true,
-		}
-		if sinceTime != nil {
-			opts.SinceTime = sinceTime
-		} else {
-			opts.SinceSeconds = sinceSeconds
-		}
-
-		req := r.clientset.CoreV1().Pods(namespace).GetLogs(podName, opts)
-		stream, err := req.Stream(ctx)
-		if err != nil {
-			if reconnectStartTime.IsZero() {
-				reconnectStartTime = time.Now()
-			}
-			if r.telemetry != nil {
-				r.telemetry.LogConnectionErrorsTotal.Add(ctx, 1, metric.WithAttributes(attribute.String("reason", classifyStreamError(err))))
-			}
-			logger.Warn("log stream failed, will retry", zap.Error(err), zap.Duration("backoff", backoff))
-
-			// MaxElapsedTime == 0 means retry indefinitely.
-			if r.cfg.ReconnectBackoff.MaxElapsedTime > 0 && time.Since(reconnectStartTime) > r.cfg.ReconnectBackoff.MaxElapsedTime {
-				logger.Info("max reconnect elapsed time exceeded, stopping stream", zap.Duration("max_elapsed_time", r.cfg.ReconnectBackoff.MaxElapsedTime))
-				return
-			}
-
-			if !retry.SleepOrDone(ctx, backoff) {
-				return
-			}
-			backoff = retry.NextBackoff(backoff, r.cfg.ReconnectBackoff.MaxInterval)
-			continue
-		}
-
-		reconnectStartTime = time.Time{}
-		backoff = r.cfg.ReconnectBackoff.InitialInterval
-
-		lastTS, scanErr := r.streamConnection(ctx, stream, logline.Meta{
+// newContainerStream wires a containerStream with everything it needs from
+// the receiver, so the stream itself holds no reference back to it.
+func (r *logsReceiver) newContainerStream(namespace, podName, podUID, containerName, key string) *containerStream {
+	return &containerStream{
+		client:    r.clientset,
+		telemetry: r.telemetry,
+		meta: logline.Meta{
 			Namespace:     namespace,
 			PodName:       podName,
 			PodUID:        podUID,
 			ContainerName: containerName,
-		})
-		_ = stream.Close()
-		if !lastTS.IsZero() {
-			lastSeenTimestamp = lastTS
-		}
-
-		if scanErr != nil {
-			logger.Debug("log stream ended, reconnecting", zap.Error(scanErr))
-		}
-
-		if !lastSeenTimestamp.IsZero() {
-			t := metav1.NewTime(lastSeenTimestamp)
-			sinceTime = &t
-		}
-
-		if r.isContainerTerminal(key) {
-			if scanErr != nil {
-				r.drainTerminalLogs(ctx, logline.Meta{
-					Namespace:     namespace,
-					PodName:       podName,
-					PodUID:        podUID,
-					ContainerName: containerName,
-				}, &lastSeenTimestamp, logger)
-			}
-			logger.Debug("container terminated, stopping log stream")
-			return
-		}
-
-		if !retry.SleepOrDone(ctx, backoff) {
-			return
-		}
+		},
+		logger: r.settings.Logger.With(
+			zap.String("namespace", namespace),
+			zap.String("pod", podName),
+			zap.String("container", containerName),
+			zap.String("podUID", podUID),
+		),
+		sinceSeconds: r.cfg.SinceSeconds,
+		backoffCfg:   r.cfg.ReconnectBackoff,
+		consume:      r.streamConnection,
+		isTerminal:   func() bool { return r.isContainerTerminal(key) },
+		backoff:      r.cfg.ReconnectBackoff.InitialInterval,
+		firstAttempt: true,
 	}
 }
 
-func (r *logsReceiver) drainTerminalLogs(ctx context.Context, m logline.Meta, lastSeenTimestamp *time.Time, logger *zap.Logger) {
-	opts := &corev1.PodLogOptions{
-		Container:  m.ContainerName,
-		Follow:     false,
-		Timestamps: true,
-	}
-	if !lastSeenTimestamp.IsZero() {
-		t := metav1.NewTime(*lastSeenTimestamp)
-		opts.SinceTime = &t
-	}
+var errPipelineRefused = errors.New("pipeline refused a batch; reconnecting to re-read it")
 
-	req := r.clientset.CoreV1().Pods(m.Namespace).GetLogs(m.PodName, opts)
-	stream, err := req.Stream(ctx)
-	if err != nil {
-		logger.Debug("final drain of terminal pod logs failed", zap.Error(err))
-		return
-	}
-	defer func() { _ = stream.Close() }()
-
-	lastTS, _ := r.streamConnection(ctx, stream, m)
-	if !lastTS.IsZero() {
-		*lastSeenTimestamp = lastTS
-	}
-}
-
-func (r *logsReceiver) streamConnection(ctx context.Context, stream io.Reader, m logline.Meta) (lastTS time.Time, scanErr error) {
+func (r *logsReceiver) streamConnection(ctx context.Context, stream io.Reader, m logline.Meta) (lastTS time.Time, _ error) {
 	maxBatch := r.batchSize()
 	flushInterval := r.flushInterval()
 
@@ -464,14 +393,25 @@ func (r *logsReceiver) streamConnection(ctx context.Context, stream io.Reader, m
 	scanner := logline.NewScanner(stream, maxSize, behavior, onOversize)
 
 	lineCh := make(chan logline.Line, maxBatch)
-	readerDone := make(chan struct{})
+	// done unblocks the reader goroutine if we return while it is parked on a
+	// send into a full lineCh (e.g. the pipeline refused a batch); without it
+	// the goroutine would leak. It does not interrupt a blocked Read — the
+	// caller's stream.Close() takes care of that.
+	done := make(chan struct{})
+	defer close(done)
+	var readErr error
 	go func() {
-		defer close(readerDone)
 		defer close(lineCh)
 		for scanner.Scan() {
-			lineCh <- scanner.Line()
+			select {
+			case lineCh <- scanner.Line():
+			case <-done:
+				return
+			}
 		}
-		scanErr = scanner.Err()
+		// Written before close(lineCh) fires, so the receive of the closed
+		// channel below is safe to order the read of readErr after it.
+		readErr = scanner.Err()
 	}()
 
 	ticker := time.NewTicker(flushInterval)
@@ -479,35 +419,41 @@ func (r *logsReceiver) streamConnection(ctx context.Context, stream io.Reader, m
 
 	var batchMaxTS time.Time
 	batch := logline.NewBatch(m)
-	flush := func() {
+
+	flush := func() bool {
 		if batch.Count() == 0 {
-			return
+			return true
 		}
-		if r.consumeBatch(ctx, batch.Logs(), batch.Count()) && !batchMaxTS.IsZero() {
+		delivered := r.consumeBatch(ctx, batch.Logs(), batch.Count())
+		if delivered && !batchMaxTS.IsZero() {
 			lastTS = batchMaxTS
 		}
 		batch = logline.NewBatch(m)
 		batchMaxTS = time.Time{}
+		return delivered
 	}
 
 	for {
 		select {
 		case item, ok := <-lineCh:
 			if !ok {
-				flush()
-				<-readerDone // scanErr is fully written before readerDone closes
-				return lastTS, scanErr
+				flush() // stream is over; nothing left to re-read from
+				return lastTS, readErr
 			}
 			batch.Append(item.Body, item.Timestamp)
 			if !item.Timestamp.IsZero() {
 				batchMaxTS = item.Timestamp
 			}
 			if batch.Count() >= maxBatch {
-				flush()
+				if !flush() {
+					return lastTS, errPipelineRefused
+				}
 				ticker.Reset(flushInterval)
 			}
 		case <-ticker.C:
-			flush()
+			if !flush() {
+				return lastTS, errPipelineRefused
+			}
 		}
 	}
 }
@@ -526,17 +472,6 @@ func (r *logsReceiver) consumeBatch(ctx context.Context, logs plog.Logs, count i
 		return false
 	}
 	return true
-}
-
-func (r *logsReceiver) emitLogLine(ctx context.Context, namespace, podName, podUID, containerName, line string, ts time.Time) {
-	b := logline.NewBatch(logline.Meta{
-		Namespace:     namespace,
-		PodName:       podName,
-		PodUID:        podUID,
-		ContainerName: containerName,
-	})
-	b.Append(line, ts)
-	r.consumeBatch(ctx, b.Logs(), b.Count())
 }
 
 func (r *logsReceiver) batchSize() int {
@@ -572,7 +507,6 @@ func (r *logsReceiver) logSizeBehavior() logline.Behavior {
 	return b
 }
 
-// Candidate to be moved to a utility or other package.
 func classifyStreamError(err error) string {
 	switch {
 	case apierrors.IsForbidden(err):

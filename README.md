@@ -46,7 +46,7 @@ but the issue was closed as inactive.
 
 ## Intentional scope
 
-This receiver collects **application container logs only** — what a pod writes to stdout/stderr. It streams every container in a discovered pod: regular containers, init containers (migrations, secret fetchers), and native sidecars (init containers with `restartPolicy: Always`). It does not and cannot collect:
+This receiver collects **application container logs only** — what a pod writes to stdout/stderr. It streams every container in a discovered pod: regular containers, init containers (migrations, secret fetchers), and native sidecars (init containers with `restartPolicy: Always`). A stream is opened only once a container has actually started (it is Running, or a previous instance terminated and left logs); while a container is still `ContainerCreating` / pulling its image the receiver attempts no connection — the pod update emitted when the container starts triggers the stream. It does not and cannot collect:
 
 - Node logs (systemd journal, kubelet, containerd daemon logs) — these live on the host filesystem and require hostPath access
 - Control plane logs (kube-apiserver, etcd, scheduler)
@@ -122,6 +122,11 @@ receivers:
       initial_interval: 1s
       max_interval: 30s
       max_elapsed_time: 5m
+    retry_on_failure:
+      enabled: true
+      initial_interval: 1s
+      max_interval: 30s
+      max_elapsed_time: 5m
     max_batch_size: 1000
     flush_interval: 200ms
     max_log_size: 1048576
@@ -185,6 +190,44 @@ receivers:
   container that exited non-zero, and native sidecars (init containers with
   `restartPolicy: Always`) are not treated as terminal, so their streams keep
   following restarts.
+- `retry_on_failure.enabled` (default `true`) / `initial_interval` /
+  `max_interval` / `max_elapsed_time`: what happens when the *pipeline* refuses
+  a batch, as opposed to the API stream dropping (which `reconnect_backoff`
+  covers). The common case is `memory_limiter` shedding load: it returns
+  `data refused due to high memory usage` and reports itself as a *recoverable*
+  error — "slow down and come back", not "this data is bad". With retry enabled
+  the batch is re-sent with jittered exponential backoff until it is accepted,
+  instead of being dropped. Because the retry blocks the container's read loop,
+  it also produces the backpressure `memory_limiter` is asking for: the receiver
+  stops reading that stream's socket, and the kubelet holds the data. Ordering
+  within a container stream is preserved — no new lines are read while a refused
+  batch is outstanding.
+
+  Errors marked *permanent* by the pipeline are dropped immediately without
+  retrying, since re-sending cannot help. `max_elapsed_time` bounds the total
+  time spent on one batch before it is dropped; `0` retries indefinitely.
+
+  When `max_elapsed_time` does expire, the receiver **closes that container's
+  stream and reconnects from the last delivered timestamp**, rather than
+  reading on. This is deliberate: the cursor only advances on a delivered
+  batch, so continuing to read would let the next successful flush move it past
+  the refused records, and no future `SinceTime` would ever ask the kubelet for
+  them again — they would be unreachable even though the kubelet still has
+  them. Reconnecting re-reads them instead. The cost is duplicates, because
+  `SinceTime` is truncated to whole seconds; the trade is deliberate, since
+  duplicate records are recoverable downstream and dropped ones are not. It is
+  logged at warn level as `pipeline refused a batch, reconnecting to re-read
+  it`, which is a reliable signal that the pipeline cannot keep up with the
+  configured stream count and batch size.
+  Disabling this restores drop-on-refusal, which loses data under memory
+  pressure — it is on by default for that reason. This mirrors the
+  `retry_on_failure` block the `filelog` receiver and the other stanza-based
+  receivers expose, except that those default it to `false`.
+
+  Note the interaction with `max_batch_size`: a retrying stream holds its batch
+  in memory for the duration, so the memory floor while the pipeline is refusing
+  is roughly `max_batch_size` × number of concurrently retrying streams. Keep
+  `max_batch_size` modest when collecting cluster-wide.
 - `max_batch_size` (default `1000`, `0` means use the default): the maximum
   number of log lines coalesced into a single `plog.Logs` / `ConsumeLogs` push
   per container stream. Each container's log stream is read independently and

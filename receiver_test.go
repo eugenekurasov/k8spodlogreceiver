@@ -2,6 +2,7 @@ package k8spodlogreceiver
 
 import (
 	"context"
+	"errors"
 	"io"
 	"strings"
 	"sync"
@@ -30,8 +31,9 @@ import (
 
 func newTestReceiver() *logsReceiver {
 	r := &logsReceiver{
-		cfg:           createDefaultConfig().(*Config),
-		activeStreams: make(map[string]context.CancelFunc),
+		cfg:                  createDefaultConfig().(*Config),
+		activeStreams:        make(map[string]context.CancelFunc),
+		terminatedContainers: make(map[string]struct{}),
 	}
 	r.startStream = func(_ context.Context, _, _, _, _, _ string) {
 		defer r.wg.Done()
@@ -39,14 +41,19 @@ func newTestReceiver() *logsReceiver {
 	return r
 }
 
+// makePod builds a pod whose containers are already Running — the common
+// discovery case. Tests exercising other states overwrite Status afterwards.
 func makePod(ns, name string, containers ...string) *corev1.Pod {
 	specs := make([]corev1.Container, len(containers))
+	statuses := make([]corev1.ContainerStatus, len(containers))
 	for i, c := range containers {
 		specs[i] = corev1.Container{Name: c}
+		statuses[i] = runningStatus(c)
 	}
 	return &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
 		Spec:       corev1.PodSpec{Containers: specs},
+		Status:     corev1.PodStatus{ContainerStatuses: statuses},
 	}
 }
 
@@ -182,6 +189,75 @@ func runningStatus(name string) corev1.ContainerStatus {
 	}
 }
 
+func waitingStatus(name, reason string) corev1.ContainerStatus {
+	return corev1.ContainerStatus{
+		Name:  name,
+		State: corev1.ContainerState{Waiting: &corev1.ContainerStateWaiting{Reason: reason}},
+	}
+}
+
+// ---- ensureStreams: waiting containers ----
+
+func TestEnsureStreams_SkipsContainerThatNeverStarted(t *testing.T) {
+	r := newTestReceiver()
+
+	var calls int
+	var mu sync.Mutex
+	r.startStream = func(_ context.Context, _, _, _, _, _ string) {
+		mu.Lock()
+		calls++
+		mu.Unlock()
+		r.wg.Done()
+	}
+	ctx := context.Background()
+
+	pod := makePod("payments", "app-abc", "api")
+	pod.Status.ContainerStatuses = []corev1.ContainerStatus{waitingStatus("api", "ContainerCreating")}
+	r.onPodAdded(ctx, pod)
+	r.wg.Wait()
+
+	mu.Lock()
+	assert.Equal(t, 0, calls, "no stream may start while the container is still creating")
+	mu.Unlock()
+
+	// The kubelet reports the container Running -> Modified event.
+	pod.Status.ContainerStatuses = []corev1.ContainerStatus{runningStatus("api")}
+	r.markContainerStates(pod)
+	r.ensureStreams(ctx, pod)
+	r.wg.Wait()
+
+	mu.Lock()
+	assert.Equal(t, 1, calls, "the stream must start once the container has started")
+	mu.Unlock()
+}
+
+func TestEnsureStreams_StreamsCrashLoopingContainer(t *testing.T) {
+	r := newTestReceiver()
+
+	var calls int
+	var mu sync.Mutex
+	r.startStream = func(_ context.Context, _, _, _, _, _ string) {
+		mu.Lock()
+		calls++
+		mu.Unlock()
+		r.wg.Done()
+	}
+	ctx := context.Background()
+
+	// Waiting now, but a previous run terminated: its logs are readable.
+	pod := makePod("payments", "app-abc", "api")
+	cs := waitingStatus("api", "CrashLoopBackOff")
+	cs.LastTerminationState = corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 1}}
+	pod.Status.ContainerStatuses = []corev1.ContainerStatus{cs}
+
+	r.onPodAdded(ctx, pod)
+	r.wg.Wait()
+
+	mu.Lock()
+	assert.Equal(t, 1, calls, "a crash-looping container has previous logs and must be streamed")
+	mu.Unlock()
+}
+
 func TestMarkContainerStates_MultiContainerJob(t *testing.T) {
 	r := newTestReceiver()
 	pod := makePod("batch", "job-abc", "worker", "helper")
@@ -264,6 +340,10 @@ func TestEnsureStreams_CoversInitContainers(t *testing.T) {
 		{Name: "migrate"},
 		{Name: "proxy", RestartPolicy: &always},
 	}
+	pod.Status.InitContainerStatuses = []corev1.ContainerStatus{
+		terminatedStatus("migrate", 0),
+		runningStatus("proxy"),
+	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -332,6 +412,20 @@ func TestOnPodAddedDeleted_RecordsActiveStreamsWithRealTelemetry(t *testing.T) {
 // ---- stream tests ----
 
 // ---- emitLogLine ----
+
+// emitLogLine wraps one line into a single-record batch and forwards it, so
+// tests can drive the record-shaping path (logline.Batch + consumeBatch)
+// without a stream. Production code always goes through streamConnection.
+func (r *logsReceiver) emitLogLine(ctx context.Context, namespace, podName, podUID, containerName, line string, ts time.Time) {
+	b := logline.NewBatch(logline.Meta{
+		Namespace:     namespace,
+		PodName:       podName,
+		PodUID:        podUID,
+		ContainerName: containerName,
+	})
+	b.Append(line, ts)
+	r.consumeBatch(ctx, b.Logs(), b.Count())
+}
 
 func TestEmitLogLine_PopulatesResourceAttributes(t *testing.T) {
 	sink := &consumertest.LogsSink{}
@@ -725,4 +819,99 @@ func TestEmitLogLine_WithRealObsreportAndTelemetry_NoPanic(t *testing.T) {
 		r.emitLogLine(context.Background(), "ns", "pod", "uid", "c", "hello", time.Time{})
 	})
 	require.Len(t, sink.AllLogs(), 1)
+}
+
+// refusingConsumer refuses the first refuseFirst batches, then accepts.
+type refusingConsumer struct {
+	mu          sync.Mutex
+	refuseFirst int
+	calls       int
+	accepted    []string
+}
+
+func (c *refusingConsumer) Capabilities() consumer.Capabilities {
+	return consumer.Capabilities{MutatesData: false}
+}
+
+func (c *refusingConsumer) ConsumeLogs(_ context.Context, ld plog.Logs) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.calls++
+	if c.calls <= c.refuseFirst {
+		return errTestRefused
+	}
+	rl := ld.ResourceLogs().At(0).ScopeLogs().At(0).LogRecords()
+	for i := 0; i < rl.Len(); i++ {
+		c.accepted = append(c.accepted, rl.At(i).Body().Str())
+	}
+	return nil
+}
+
+var errTestRefused = errors.New("data refused due to high memory usage")
+
+// streamConnection must abort the connection when a batch is refused, rather
+// than reading on. Reading on would let a later successful flush advance lastTS
+// past the refused records, making them permanently unreachable — the whole
+// point of errPipelineRefused is to force a reconnect that re-reads them.
+func TestStreamConnection_AbortsOnRefusalSoRecordsCanBeReRead(t *testing.T) {
+	r := newTestReceiver()
+	r.cfg.MaxBatchSize = 1
+	r.cfg.FlushInterval = time.Hour // only size-triggered flushes
+	r.settings = receivertest.NewNopSettings(metadata.Type)
+
+	// Accept the first line, refuse the second.
+	c := &refusingConsumer{}
+	c.refuseFirst = 0
+	r.consumer = &oneShotRefuser{next: c, refuseOn: 2}
+
+	stream := io.NopCloser(strings.NewReader(
+		"2026-08-14T10:00:01.000000000Z first\n" +
+			"2026-08-14T10:00:02.000000000Z second\n" +
+			"2026-08-14T10:00:03.000000000Z third\n",
+	))
+
+	lastTS, err := r.streamConnection(context.Background(), stream, logline.Meta{
+		Namespace: "ns", PodName: "pod", ContainerName: "c",
+	})
+
+	require.ErrorIs(t, err, errPipelineRefused, "refusal must abort the connection")
+	assert.Equal(t, "2026-08-14T10:00:01Z", lastTS.UTC().Format(time.RFC3339),
+		"lastTS must stay at the last delivered record so the reconnect re-reads the refused one")
+	assert.Equal(t, []string{"first"}, c.accepted, "third must not be delivered ahead of the gap")
+}
+
+// oneShotRefuser refuses exactly the refuseOn-th call, delegating the rest.
+type oneShotRefuser struct {
+	next     consumer.Logs
+	refuseOn int
+	calls    int
+}
+
+func (o *oneShotRefuser) Capabilities() consumer.Capabilities {
+	return consumer.Capabilities{MutatesData: false}
+}
+
+func (o *oneShotRefuser) ConsumeLogs(ctx context.Context, ld plog.Logs) error {
+	o.calls++
+	if o.calls == o.refuseOn {
+		return errTestRefused
+	}
+	return o.next.ConsumeLogs(ctx, ld)
+}
+
+// A clean stream end must still return the scanner result, not errPipelineRefused.
+func TestStreamConnection_NormalEndIsNotAnAbort(t *testing.T) {
+	r := newTestReceiver()
+	r.cfg.MaxBatchSize = 10
+	r.cfg.FlushInterval = 10 * time.Millisecond
+	r.settings = receivertest.NewNopSettings(metadata.Type)
+	r.consumer = consumertest.NewNop()
+
+	stream := io.NopCloser(strings.NewReader("2026-08-14T10:00:01.000000000Z only\n"))
+
+	lastTS, err := r.streamConnection(context.Background(), stream, logline.Meta{
+		Namespace: "ns", PodName: "pod", ContainerName: "c",
+	})
+	require.NoError(t, err)
+	assert.Equal(t, "2026-08-14T10:00:01Z", lastTS.UTC().Format(time.RFC3339))
 }

@@ -12,13 +12,26 @@
 // instead of reimplemented, per Apache-2.0's permission to redistribute with
 // attribution.
 //
+// Deliberate divergences from the upstream copy:
+//
+//   - The storage-extension checkpointer was dropped (see AGENTS.md for why a
+//     committed discovery RV is unsafe for this receiver).
+//   - The initial state is always emitted, and a watch restart (usually a
+//     410 Gone) re-emits the full current state as synthetic Added events
+//     instead of re-listing only for a fresh resourceVersion. Upstream
+//     discards the listed objects, so anything created during the blind
+//     window is never emitted; here that would mean a pod whose log stream
+//     never starts. Consumers must handle Added idempotently.
+//   - The unused knobs were removed with their code paths: the
+//     IncludeInitialState flag (always on now), and the ResourceVersion /
+//     FieldSelector config fields (with getResourceVersion and
+//     fetchListResourceVersion, which only served them).
+//
 
 package watch // import "github.com/eugenekurasov/security-observability-stack/otel-components/k8spodlogreceiver/internal/watch"
 
 import (
 	"context"
-	"errors"
-	"fmt"
 	"net/http"
 	"sync"
 	"time"
@@ -39,22 +52,19 @@ import (
 const (
 	defaultResourceVersion = "1"
 
-	// Backoff applied specifically when getResourceVersion fails (a real
-	// error, e.g. apiserver unreachable) — not applied to the routine 410
-	// Gone restart path, which must keep retrying immediately.
-	getResourceVersionBackoffInitial = 1 * time.Second
-	getResourceVersionBackoffMax     = 30 * time.Second
+	// Backoff applied when the state re-List fails (a real error, e.g.
+	// apiserver unreachable) — the routine 410 Gone restart itself retries
+	// immediately.
+	relistBackoffInitial = 1 * time.Second
+	relistBackoffMax     = 30 * time.Second
 )
 
 type Config struct {
-	Gvr             schema.GroupVersionResource
-	Namespaces      []string
-	LabelSelector   string
-	FieldSelector   string
-	ResourceVersion string
+	Gvr           schema.GroupVersionResource
+	Namespaces    []string
+	LabelSelector string
 
-	IncludeInitialState bool
-	Exclude             map[apiWatch.EventType]bool
+	Exclude map[apiWatch.EventType]bool
 }
 
 type Observer struct {
@@ -66,13 +76,13 @@ type Observer struct {
 	handleWatchEventFunc func(event *apiWatch.Event)
 }
 
-func New(client dynamic.Interface, config Config, logger *zap.Logger, handleWatchEventFunc func(event *apiWatch.Event)) (*Observer, error) {
+func New(client dynamic.Interface, config Config, logger *zap.Logger, handleWatchEventFunc func(event *apiWatch.Event)) *Observer {
 	return &Observer{
 		client:               client,
 		config:               config,
 		logger:               logger,
 		handleWatchEventFunc: handleWatchEventFunc,
-	}, nil
+	}
 }
 
 func (o *Observer) Start(ctx context.Context, wg *sync.WaitGroup) chan struct{} {
@@ -101,61 +111,51 @@ func (o *Observer) startWatch(ctx context.Context, resource dynamic.ResourceInte
 	defer wg.Done()
 
 	watchFunc := func(watchCtx context.Context, options metav1.ListOptions) (apiWatch.Interface, error) {
-		options.FieldSelector = o.config.FieldSelector
 		options.LabelSelector = o.config.LabelSelector
 		return resource.Watch(watchCtx, options)
 	}
 
 	cancelCtx, cancel := context.WithCancel(ctx)
 
-	// initialListRV holds the list resourceVersion returned by sendInitialState.
-	// It is used as the watch starting point on the first iteration, eliminating
-	// a second List() call and closing the race window between the two listings.
-	// It is cleared after the first iteration so subsequent restarts (e.g. after
-	// a 410 Gone) fall back to getResourceVersion() as normal.
-	var initialListRV string
-	if o.config.IncludeInitialState {
-		initialListRV = o.sendInitialState(ctx, resource, namespace)
-	}
+	// initialListRV holds the list resourceVersion of the startup
+	// sendInitialState; the first iteration reuses it as the watch starting
+	// point, avoiding a second List() and the race window between two
+	// listings. It is "" when that List failed — then the first iteration
+	// falls into the re-List branch below like any restart.
+	initialListRV := o.sendInitialState(ctx, resource, namespace)
 
-	backoff := getResourceVersionBackoffInitial
+	backoff := relistBackoffInitial
 
 	wait.UntilWithContext(cancelCtx, func(newCtx context.Context) {
 		var resourceVersion string
 		if initialListRV != "" {
-			// First iteration: reuse the list RV from sendInitialState directly,
-			// avoiding a redundant List() call and the race window it creates.
 			resourceVersion = initialListRV
 			initialListRV = ""
 		} else {
-			var err error
-			resourceVersion, err = o.getResourceVersion(newCtx, resource)
-			if err != nil {
-				o.logger.Error("could not retrieve a resourceVersion, will retry",
-					zap.String("resource", o.config.Gvr.String()),
-					zap.String("namespace", namespace),
-					zap.Duration("backoff", backoff),
-					zap.Error(err))
-				// A real error (e.g. apiserver unreachable), not a routine
-				// 410 — back off instead of hot-looping or giving up.
+			// Restarting after a broken watch — usually a 410 Gone, meaning
+			// our resourceVersion was compacted away. The events missed while
+			// blind are gone from etcd and can never be replayed, so re-List
+			// and re-emit the current state as synthetic Added events instead
+			// of only grabbing a fresh resourceVersion (see the divergence
+			// note in the file header). Consumers must treat Added
+			// idempotently.
+			resourceVersion = o.sendInitialState(newCtx, resource, namespace)
+			if resourceVersion == "" {
+				// List failed (already logged); back off instead of
+				// hot-looping on an unreachable apiserver.
 				if !retry.SleepOrDone(newCtx, backoff) {
 					cancel()
 					return
 				}
-				backoff = retry.NextBackoff(backoff, getResourceVersionBackoffMax)
+				backoff = retry.NextBackoff(backoff, relistBackoffMax)
 				return
 			}
 		}
-		backoff = getResourceVersionBackoffInitial
+		backoff = relistBackoffInitial
 
-		done := o.doWatch(ctx, resourceVersion, watchFunc, stopperChan)
-		if done {
+		if done := o.doWatch(ctx, resourceVersion, watchFunc, stopperChan); done {
 			cancel()
-			return
 		}
-
-		// need to restart with a fresh resource version
-		o.config.ResourceVersion = ""
 	}, 0)
 }
 
@@ -168,7 +168,6 @@ func (o *Observer) sendInitialState(ctx context.Context, resource dynamic.Resour
 		zap.Strings("namespaces", o.config.Namespaces))
 
 	listOption := metav1.ListOptions{
-		FieldSelector: o.config.FieldSelector,
 		LabelSelector: o.config.LabelSelector,
 	}
 
@@ -181,6 +180,11 @@ func (o *Observer) sendInitialState(ctx context.Context, resource dynamic.Resour
 	}
 
 	listRV := objects.GetResourceVersion()
+	if listRV == "" || listRV == "0" {
+		// A watch cannot start from an empty resourceVersion, and callers
+		// use "" to mean "the List itself failed".
+		listRV = defaultResourceVersion
+	}
 
 	if len(objects.Items) == 0 {
 		o.logger.Debug("no objects found for initial state",
@@ -253,34 +257,4 @@ func (o *Observer) doWatch(ctx context.Context, resourceVersion string, watchFun
 			return true
 		}
 	}
-}
-
-func (o *Observer) fetchListResourceVersion(ctx context.Context, resource dynamic.ResourceInterface) (string, error) {
-	objects, err := resource.List(ctx, metav1.ListOptions{
-		FieldSelector: o.config.FieldSelector,
-		LabelSelector: o.config.LabelSelector,
-	})
-	if err != nil {
-		return "", fmt.Errorf("could not perform initial list for watch on %s, %w", o.config.Gvr.String(), err)
-	}
-	if objects == nil {
-		return "", errors.New("nil objects returned, this is an error in the k8s observer")
-	}
-
-	listVersion := objects.GetResourceVersion()
-
-	// If we still don't have a resourceVersion, use default
-	if listVersion == "" || listVersion == "0" {
-		listVersion = defaultResourceVersion
-	}
-
-	return listVersion, nil
-}
-
-func (o *Observer) getResourceVersion(ctx context.Context, resource dynamic.ResourceInterface) (string, error) {
-	configVersion := o.config.ResourceVersion
-	if configVersion != "" && configVersion != "0" {
-		return configVersion, nil
-	}
-	return o.fetchListResourceVersion(ctx, resource)
 }

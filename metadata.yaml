@@ -1,5 +1,5 @@
 display_name: Kubernetes Pod Logs Receiver
-type: k8s_podlog
+type: k8s_pod_log
 description: The Kubernetes Pod Logs Receiver collects logs from the Kubernetes API server.
 
 status:

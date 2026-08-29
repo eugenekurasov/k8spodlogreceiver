@@ -96,15 +96,36 @@ func (s *containerStream) open(ctx context.Context) (io.ReadCloser, error) {
 		Follow:     true,
 		Timestamps: true,
 	}
-	if s.resumeFrom.IsZero() {
-		opts.SinceSeconds = s.sinceSeconds
-	} else {
-		t := metav1.NewTime(s.resumeFrom)
-		opts.SinceTime = &t
-	}
+	opts.SinceTime, opts.SinceSeconds = streamStartPoint(s.resumeFrom, s.sinceSeconds, time.Now())
 
 	req := s.client.CoreV1().Pods(s.meta.Namespace).GetLogs(s.meta.PodName, opts)
 	return req.Stream(ctx)
+}
+
+// streamStartPoint decides where a stream begins reading, as the pair of
+// mutually exclusive PodLogOptions fields the API accepts.
+//
+// The sinceSeconds == 0 case is the subtle one. Config documents it as "fresh
+// logs only, no historical backfill", but it cannot be passed through: the API
+// server rejects it outright with
+//
+//	PodLogOptions is invalid: sinceSeconds: Invalid value: 0: must be greater than 0
+//
+// which would fail every connect attempt and deliver nothing. sinceTime=now is
+// the equivalent the API does accept, so "no backfill" is expressed that way.
+func streamStartPoint(resumeFrom time.Time, sinceSeconds *int64, now time.Time) (*metav1.Time, *int64) {
+	switch {
+	case !resumeFrom.IsZero():
+		// Reconnect: resume just after the last line already delivered.
+		t := metav1.NewTime(resumeFrom)
+		return &t, nil
+	case sinceSeconds != nil && *sinceSeconds == 0:
+		t := metav1.NewTime(now)
+		return &t, nil
+	default:
+		// A nil sinceSeconds leaves both unset: full retained history.
+		return nil, sinceSeconds
+	}
 }
 
 // retryAfterConnectError reports whether another connect should be attempted.

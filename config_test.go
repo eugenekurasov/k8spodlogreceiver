@@ -103,7 +103,7 @@ func TestLoadConfig_Testdata(t *testing.T) {
 	cm, err := confmaptest.LoadConf("testdata/config.yaml")
 	require.NoError(t, err)
 
-	sub, err := cm.Sub("receivers::k8s_podlog")
+	sub, err := cm.Sub("receivers::k8s_pod_log")
 	require.NoError(t, err)
 
 	// Unmarshal into a zero-value Config, not createDefaultConfig()'s
@@ -119,6 +119,8 @@ func TestLoadConfig_Testdata(t *testing.T) {
 	assert.Equal(t, "app.kubernetes.io/part-of=payments", cfg.PodLabelSelector)
 	require.NotNil(t, cfg.SinceSeconds)
 	assert.Equal(t, int64(300), *cfg.SinceSeconds)
+	require.NotNil(t, cfg.PodResyncPeriod)
+	assert.Equal(t, 10*time.Minute, *cfg.PodResyncPeriod)
 	assert.Equal(t, AuthTypeServiceAccount, cfg.APIConfig.AuthType)
 	assert.Equal(t, float32(20), cfg.APIConfig.KubeAPIQPS)
 	assert.Equal(t, 40, cfg.APIConfig.KubeAPIBurst)
@@ -129,6 +131,12 @@ func TestLoadConfig_Testdata(t *testing.T) {
 	assert.Equal(t, 250*time.Millisecond, cfg.FlushInterval)
 	assert.Equal(t, 2097152, cfg.MaxLogSize)
 	assert.Equal(t, "truncate", cfg.MaxLogSizeBehavior)
+}
+
+func TestConfigValidate_NegativePodResyncPeriod(t *testing.T) {
+	period := -1 * time.Second
+	cfg := &Config{APIConfig: APIConfig{AuthType: AuthTypeServiceAccount}, PodResyncPeriod: &period}
+	assert.Error(t, cfg.Validate())
 }
 
 func TestConfigValidate_NegativeMaxBatchSize(t *testing.T) {

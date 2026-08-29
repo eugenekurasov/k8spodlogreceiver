@@ -43,6 +43,19 @@ type Config struct {
 	// re-read of full available log history on collector restart.
 	SinceSeconds *int64 `mapstructure:"since_seconds"`
 
+	// PodResyncPeriod is how often the pod informer re-delivers every pod it
+	// has cached as an update. That re-runs the receiver's (idempotent)
+	// stream bookkeeping, so it doubles as a self-healing sweep: a container
+	// stream that gave up — say after ReconnectBackoff.MaxElapsedTime — is
+	// started again on the next resync instead of waiting for that pod to
+	// change. Resyncs are served from the local cache and cost no API server
+	// traffic. Three states, via the pointer:
+	//   - nil (key absent from config): defaultPodResyncPeriod.
+	//   - pointer to 0: no resync; streams start only on real pod events.
+	//   - pointer to N > 0: resync every N.
+	// Negative is rejected by Validate.
+	PodResyncPeriod *time.Duration `mapstructure:"pod_resync_period"`
+
 	// ReconnectBackoff controls the retry/backoff behavior when a log
 	// stream from the kubelet is interrupted (rotation, pod restart,
 	// transient API server errors).
@@ -94,6 +107,11 @@ const (
 	// defaultMaxLogSize is the fallback per-record size cap (1 MiB), matching
 	// the filelog receiver's default max_log_size.
 	defaultMaxLogSize = 1024 * 1024
+
+	// defaultPodResyncPeriod is the fallback informer resync interval. Long
+	// enough that walking the pod cache is negligible, short enough that a
+	// stream which gave up is not left dead for long.
+	defaultPodResyncPeriod = 10 * time.Minute
 )
 
 // APIConfig controls how the receiver authenticates to the API server.
@@ -149,6 +167,9 @@ var (
 func (cfg *Config) Validate() error {
 	if cfg.SinceSeconds != nil && *cfg.SinceSeconds < 0 {
 		return errors.New("k8spodlogreceiver: since_seconds must be >= 0")
+	}
+	if cfg.PodResyncPeriod != nil && *cfg.PodResyncPeriod < 0 {
+		return errors.New("k8spodlogreceiver: pod_resync_period must be >= 0")
 	}
 	if cfg.ReconnectBackoff.InitialInterval < 0 {
 		return errors.New("k8spodlogreceiver: reconnect_backoff.initial_interval must be >= 0")

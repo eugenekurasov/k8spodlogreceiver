@@ -15,7 +15,7 @@ import (
 	"go.opentelemetry.io/collector/receiver/receivertest"
 )
 
-var typ = component.MustNewType("k8s_podlog")
+var typ = component.MustNewType("k8s_pod_log")
 
 func TestComponentFactoryType(t *testing.T) {
 	require.Equal(t, typ, NewFactory().Type())

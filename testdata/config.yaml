@@ -1,8 +1,9 @@
 receivers:
-  k8s_podlog:
+  k8s_pod_log:
     namespaces: [payment, api-gateway]
     pod_label_selector: app.kubernetes.io/part-of=payments
     since_seconds: 300
+    pod_resync_period: 10m
     api_config:
       auth_type: serviceAccount
       kube_api_qps: 20
@@ -25,6 +26,6 @@ exporters:
 service:
   pipelines:
     logs:
-      receivers: [k8s_podlog]
+      receivers: [k8s_pod_log]
       processors: [nop]
       exporters: [nop]

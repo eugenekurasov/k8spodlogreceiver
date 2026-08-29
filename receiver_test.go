@@ -20,10 +20,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
-	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
-	"k8s.io/apimachinery/pkg/watch"
 
 	"github.com/eugenekurasov/security-observability-stack/otel-components/k8spodlogreceiver/internal/logline"
 	"github.com/eugenekurasov/security-observability-stack/otel-components/k8spodlogreceiver/internal/metadata"
@@ -57,16 +54,6 @@ func makePod(ns, name string, containers ...string) *corev1.Pod {
 	}
 }
 
-// podEvent wraps a typed pod as an Observer watch event, mirroring how the
-// Observer delivers objects (as *unstructured.Unstructured).
-func podEvent(t watch.EventType, pod *corev1.Pod) *watch.Event {
-	obj, err := runtime.DefaultUnstructuredConverter.ToUnstructured(pod)
-	if err != nil {
-		panic(err)
-	}
-	return &watch.Event{Type: t, Object: &unstructured.Unstructured{Object: obj}}
-}
-
 func TestOnPodAdded_RegistersStreamsPerContainer(t *testing.T) {
 	r := newTestReceiver()
 
@@ -86,25 +73,68 @@ func TestOnPodAdded_RegistersStreamsPerContainer(t *testing.T) {
 	r.wg.Wait()
 }
 
-// TestModifiedEventStartsStreamsForNeverAddedPod covers the watch-restart (410)
-// gap: a pod created while the watch was disconnected is never re-emitted as
-// Added, so streams must still start when its first Modified event arrives.
-func TestModifiedEventStartsStreamsForNeverAddedPod(t *testing.T) {
+// TestUpdateStartsStreamsForNeverAddedPod covers the informer's update path,
+// which carries both real pod changes and every resync tick: it must start
+// streams for a pod no Add was ever seen for, and restart streams that ended.
+func TestUpdateStartsStreamsForNeverAddedPod(t *testing.T) {
 	r := newTestReceiver()
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// No prior onPodAdded — simulate a pod first seen via Modified.
-	r.handlePodEvent(ctx, podEvent(watch.Modified, makePod("payments", "app-abc", "api")))
+	// No prior onPodAdded — the pod is first seen through an update.
+	pod := makePod("payments", "app-abc", "api")
+	r.markContainerStates(pod)
+	r.ensureStreams(ctx, pod)
 
 	r.mu.Lock()
 	_, hasAPI := r.activeStreams["payments/app-abc/api"]
 	r.mu.Unlock()
-	assert.True(t, hasAPI, "Modified event must start streams for a pod that was never Added")
+	assert.True(t, hasAPI, "an update must start streams for a pod that was never added")
 
 	cancel()
 	r.wg.Wait()
+}
+
+// TestPodDeleted_CancelsStreamsFromTombstonedPod covers what discovery hands
+// back when a delete was only inferred from a re-listing: the last cached pod.
+// The receiver must cancel its streams the same as for a live delete.
+func TestPodDeleted_CancelsStreamsFromTombstonedPod(t *testing.T) {
+	r := newTestReceiver()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	pod := makePod("payments", "app-abc", "api")
+	r.onPodAdded(ctx, pod)
+
+	r.mu.Lock()
+	_, live := r.activeStreams["payments/app-abc/api"]
+	r.mu.Unlock()
+	require.True(t, live, "stream must be running before the delete")
+
+	r.onPodDeleted(pod)
+
+	r.mu.Lock()
+	_, stillLive := r.activeStreams["payments/app-abc/api"]
+	r.mu.Unlock()
+	assert.False(t, stillLive, "a tombstoned pod's streams must be cancelled")
+
+	cancel()
+	r.wg.Wait()
+}
+
+func TestPodResyncPeriod_Defaults(t *testing.T) {
+	r := &logsReceiver{cfg: createDefaultConfig().(*Config)}
+	assert.Equal(t, defaultPodResyncPeriod, r.podResyncPeriod(), "an unset period must fall back to the default")
+
+	disabled := time.Duration(0)
+	r.cfg.PodResyncPeriod = &disabled
+	assert.Equal(t, time.Duration(0), r.podResyncPeriod(), "an explicit zero must disable resyncs, not re-default")
+
+	custom := 90 * time.Second
+	r.cfg.PodResyncPeriod = &custom
+	assert.Equal(t, custom, r.podResyncPeriod())
 }
 
 func TestOnPodAdded_Deduplicates(t *testing.T) {
@@ -489,6 +519,51 @@ func TestEmitLogLine_UsesProvidedTimestamp(t *testing.T) {
 	require.Len(t, sink.AllLogs(), 1)
 	got := sink.AllLogs()[0].ResourceLogs().At(0).ScopeLogs().At(0).LogRecords().At(0).Timestamp().AsTime()
 	assert.True(t, got.Equal(want), "expected %v, got %v", want, got)
+}
+
+// ---- stream start point ----
+
+// TestStreamStartPoint_ZeroSinceSecondsUsesSinceTime guards a real API
+// constraint: the server rejects sinceSeconds=0 with "must be greater than 0",
+// so passing the configured 0 straight through would fail every connect and
+// deliver nothing. "No backfill" has to go out as sinceTime=now.
+func TestStreamStartPoint_ZeroSinceSecondsUsesSinceTime(t *testing.T) {
+	now := time.Date(2026, 8, 28, 20, 0, 0, 0, time.UTC)
+	zero := int64(0)
+
+	sinceTime, sinceSeconds := streamStartPoint(time.Time{}, &zero, now)
+
+	require.NotNil(t, sinceTime, "zero since_seconds must become an explicit sinceTime")
+	assert.True(t, sinceTime.Time.Equal(now))
+	assert.Nil(t, sinceSeconds, "sinceSeconds must not be sent alongside sinceTime")
+}
+
+func TestStreamStartPoint_PositiveSinceSecondsPassesThrough(t *testing.T) {
+	want := int64(300)
+
+	sinceTime, sinceSeconds := streamStartPoint(time.Time{}, &want, time.Now())
+
+	assert.Nil(t, sinceTime)
+	require.NotNil(t, sinceSeconds)
+	assert.Equal(t, want, *sinceSeconds)
+}
+
+func TestStreamStartPoint_UnsetReadsFullHistory(t *testing.T) {
+	sinceTime, sinceSeconds := streamStartPoint(time.Time{}, nil, time.Now())
+
+	assert.Nil(t, sinceTime, "both fields unset is what asks the API for all retained logs")
+	assert.Nil(t, sinceSeconds)
+}
+
+func TestStreamStartPoint_ResumeWins(t *testing.T) {
+	resume := time.Date(2026, 8, 28, 19, 30, 0, 0, time.UTC)
+	zero := int64(0)
+
+	sinceTime, sinceSeconds := streamStartPoint(resume, &zero, time.Now())
+
+	require.NotNil(t, sinceTime)
+	assert.True(t, sinceTime.Time.Equal(resume), "a reconnect must resume from the cursor, not re-apply since_seconds")
+	assert.Nil(t, sinceSeconds)
 }
 
 // ---- streamConnection batching ----

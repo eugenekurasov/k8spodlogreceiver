@@ -20,12 +20,7 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
-	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/apimachinery/pkg/runtime/schema"
 	utilnet "k8s.io/apimachinery/pkg/util/net"
-	apiWatch "k8s.io/apimachinery/pkg/watch"
-	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 
@@ -33,11 +28,8 @@ import (
 	"github.com/eugenekurasov/security-observability-stack/otel-components/k8spodlogreceiver/internal/k8sconfig"
 	"github.com/eugenekurasov/security-observability-stack/otel-components/k8spodlogreceiver/internal/logline"
 	"github.com/eugenekurasov/security-observability-stack/otel-components/k8spodlogreceiver/internal/metadata"
-	"github.com/eugenekurasov/security-observability-stack/otel-components/k8spodlogreceiver/internal/watch"
+	"github.com/eugenekurasov/security-observability-stack/otel-components/k8spodlogreceiver/internal/poddiscovery"
 )
-
-// podGVR is the GroupVersionResource the pod Observer watches.
-var podGVR = schema.GroupVersionResource{Group: "", Version: "v1", Resource: "pods"}
 
 const (
 	eventTypeAdded   = "added"
@@ -54,11 +46,7 @@ type logsReceiver struct {
 	consumer consumer.Logs
 	// kubernetes.Interface instead of *kubernetes.Clientset so tests can
 	// inject fake.NewSimpleClientset() without a real API server.
-	clientset kubernetes.Interface
-	// dynamicClient drives pod discovery through the watch.Observer. It shares
-	// httpClient's transport (built from the same rest.Config) so Shutdown's
-	// CloseIdleConnections() covers it too.
-	dynamicClient        dynamic.Interface
+	clientset            kubernetes.Interface
 	httpClient           *http.Client
 	cancel               context.CancelFunc
 	wg                   sync.WaitGroup
@@ -119,23 +107,42 @@ func (r *logsReceiver) Start(ctx context.Context, _ component.Host) error {
 	}
 	r.clientset = clientset
 
-	dynamicClient, err := dynamic.NewForConfigAndClient(restCfg, httpClient)
-	if err != nil {
-		return fmt.Errorf("k8spodlogreceiver: building dynamic client: %w", err)
-	}
-	r.dynamicClient = dynamicClient
-
 	ctx, cancel := context.WithCancel(ctx)
 	r.cancel = cancel
 
-	r.startPodObserver(ctx)
+	if err := r.startPodDiscovery(ctx); err != nil {
+		cancel()
+		return fmt.Errorf("k8spodlogreceiver: starting pod discovery: %w", err)
+	}
+
+	r.settings.Logger.Info("started collecting pod logs",
+		zap.String("since", sinceForLog(r.cfg.SinceSeconds)),
+		zap.Int("max_batch_size", r.batchSize()),
+		zap.Duration("flush_interval", r.flushInterval()),
+		zap.Int("max_log_size", r.maxLogSize()),
+		zap.Stringer("max_log_size_behavior", r.logSizeBehavior()))
 	return nil
+}
+
+// sinceForLog renders the three states of SinceSeconds, which a plain int64
+// field cannot express: unset reads as "full history", not as zero.
+func sinceForLog(sinceSeconds *int64) string {
+	if sinceSeconds == nil {
+		return "full available history"
+	}
+	return (time.Duration(*sinceSeconds) * time.Second).String()
 }
 
 func (r *logsReceiver) Shutdown(context.Context) error {
 	if r.cancel != nil {
 		r.cancel()
 	}
+
+	r.mu.Lock()
+	draining := len(r.activeStreams)
+	r.mu.Unlock()
+	r.settings.Logger.Info("stopping pod log collection", zap.Int("draining_streams", draining))
+
 	r.wg.Wait()
 	if r.httpClient != nil {
 		// Not r.httpClient.CloseIdleConnections(): rest.HTTPClientFor wraps the
@@ -149,43 +156,28 @@ func (r *logsReceiver) Shutdown(context.Context) error {
 	return nil
 }
 
-func (r *logsReceiver) startPodObserver(ctx context.Context) {
-	observer := watch.New(
-		r.dynamicClient,
-		watch.Config{
-			Gvr:           podGVR,
+func (r *logsReceiver) startPodDiscovery(ctx context.Context) error {
+	discovery := poddiscovery.New(
+		r.clientset,
+		poddiscovery.Config{
 			Namespaces:    r.cfg.Namespaces,
 			LabelSelector: r.cfg.PodLabelSelector,
-			// Bookmarks carry only a resourceVersion, no pod payload — drop them.
-			Exclude: map[apiWatch.EventType]bool{apiWatch.Bookmark: true},
+			ResyncPeriod:  r.podResyncPeriod(),
 		},
 		r.settings.Logger,
-		func(event *apiWatch.Event) { r.handlePodEvent(ctx, event) },
+		poddiscovery.Handler{
+			OnAdd: r.onPodAdded,
+			// A resync delivers every cached pod here, which is what restarts
+			// a stream that gave up (e.g. ReconnectBackoff.MaxElapsedTime):
+			// both calls below are idempotent.
+			OnUpdate: func(updateCtx context.Context, pod *corev1.Pod) {
+				r.markContainerStates(pod)
+				r.ensureStreams(updateCtx, pod)
+			},
+			OnDelete: r.onPodDeleted,
+		},
 	)
-
-	observer.Start(ctx, &r.wg)
-}
-
-func (r *logsReceiver) handlePodEvent(ctx context.Context, event *apiWatch.Event) {
-	u, ok := event.Object.(*unstructured.Unstructured)
-	if !ok {
-		return
-	}
-	pod := &corev1.Pod{}
-	if err := runtime.DefaultUnstructuredConverter.FromUnstructured(u.Object, pod); err != nil {
-		r.settings.Logger.Warn("failed to convert watch event object to Pod", zap.Error(err))
-		return
-	}
-
-	switch event.Type {
-	case apiWatch.Added:
-		r.onPodAdded(ctx, pod)
-	case apiWatch.Modified:
-		r.markContainerStates(pod)
-		r.ensureStreams(ctx, pod)
-	case apiWatch.Deleted:
-		r.onPodDeleted(pod)
-	}
+	return discovery.Start(ctx, &r.wg)
 }
 
 func (r *logsReceiver) onPodAdded(ctx context.Context, pod *corev1.Pod) {
@@ -465,13 +457,20 @@ func (r *logsReceiver) consumeBatch(ctx context.Context, logs plog.Logs, count i
 	}
 	err := r.consumer.ConsumeLogs(consumeCtx, logs)
 	if r.obsrep != nil {
-		r.obsrep.EndLogsOp(consumeCtx, "k8s_podlog", count, err)
+		r.obsrep.EndLogsOp(consumeCtx, "k8s_pod_log", count, err)
 	}
 	if err != nil {
 		r.settings.Logger.Error("failed to forward log records to pipeline", zap.Error(err))
 		return false
 	}
 	return true
+}
+
+func (r *logsReceiver) podResyncPeriod() time.Duration {
+	if r.cfg == nil || r.cfg.PodResyncPeriod == nil {
+		return defaultPodResyncPeriod
+	}
+	return *r.cfg.PodResyncPeriod
 }
 
 func (r *logsReceiver) batchSize() int {

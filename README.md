@@ -84,7 +84,7 @@ Example collector config:
 
 ```yaml
 receivers:
-  k8s_podlog:
+  k8s_pod_log:
     namespaces: ["payments", "billing"]
     pod_label_selector: "app.kubernetes.io/part-of=payments-platform"
     since_seconds: 300
@@ -96,7 +96,7 @@ exporters:
 service:
   pipelines:
     logs:
-      receivers: [k8s_podlog]
+      receivers: [k8s_pod_log]
       exporters: [otlp]
 ```
 
@@ -110,7 +110,7 @@ different distribution.
 
 ```yaml
 receivers:
-  k8s_podlog:
+  k8s_pod_log:
     api_config:
       auth_type: serviceAccount
       kube_api_qps: 20
@@ -172,6 +172,16 @@ receivers:
 
   Set an explicit bound in production to avoid a thundering-herd re-read of
   full available log history across every container on collector restart.
+- `pod_resync_period`: how often the pod informer re-delivers every pod it has
+  cached, which re-runs the receiver's stream bookkeeping. Because that
+  bookkeeping is idempotent, a resync doubles as a self-healing sweep: a
+  container stream that gave up (see `reconnect_backoff.max_elapsed_time`) is
+  started again on the next resync rather than waiting for that pod to change.
+  Resyncs are served from the informer's local cache and cost no API server
+  traffic. Three states:
+  - unset / key absent (default): 10 minutes.
+  - `0`: no resync — streams start only on real pod events.
+  - `N > 0`: resync every `N`.
 - `reconnect_backoff.initial_interval` / `max_interval` / `max_elapsed_time`:
   exponential backoff applied when a log stream drops (pod restart, kubelet
   log rotation, transient API server error) before reconnecting. The delay
@@ -374,14 +384,27 @@ scoping — for Kubernetes clusters. See
 
 ## Third-party code
 
-`internal/watch` is copied, with adaptations, from
-[`internal/k8sinventory/watch`](https://github.com/open-telemetry/opentelemetry-collector-contrib/blob/main/internal/k8sinventory/watch/observer.go)
-in `opentelemetry-collector-contrib` (Copyright The OpenTelemetry Authors,
-licensed Apache-2.0). That package lives under an `internal/` path, so Go's
-package visibility rules allow it to be imported only from within the contrib
-module tree — it is redistributed here with attribution rather than
-reimplemented, as Apache-2.0 permits. The same attribution appears in the file
-header of [`internal/watch/observer.go`](internal/watch/observer.go).
+Two packages are derived from `opentelemetry-collector-contrib` (Copyright
+The OpenTelemetry Authors, licensed Apache-2.0). Both live under an
+`internal/` path upstream, so Go's package visibility rules allow them to be
+imported only from within the contrib module tree — they are redistributed
+here with attribution rather than reimplemented, as Apache-2.0 permits. Each
+file carries the upstream copyright header and a note on how it diverges:
+
+- [`internal/consumerretry`](internal/consumerretry/logs.go) — a copy of
+  contrib's `internal/coreinternal/consumerretry`.
+- [`internal/k8sconfig`](internal/k8sconfig/config.go) — adapted from
+  contrib's `internal/k8sconfig` (`APIConfig`, `CreateRestConfig`).
+
+Pod discovery (`internal/poddiscovery`) was also once a copy — of contrib's
+`internal/k8sinventory/watch` — but that package was removed when discovery
+moved to a client-go `SharedIndexInformer`, which provides the same
+List/Watch loop plus a cache, and with it correct recovery from a compacted
+watch resourceVersion (410 Gone) that a cacheless observer cannot do.
+
+The files under `internal/metadata`, `internal/metadatatest`, and the
+`generated_*.go` files are produced by `mdatagen` from
+[`metadata.yaml`](metadata.yaml); regenerate them rather than editing them.
 
 All other code in this directory is original to this repository and licensed
 under [Apache-2.0](../../LICENSE).

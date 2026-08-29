@@ -26,7 +26,8 @@ func createDefaultConfig() component.Config {
 		APIConfig: APIConfig{
 			AuthType: AuthTypeServiceAccount,
 		},
-		SinceSeconds: nil, // full available history by default; set explicitly to bound it
+		SinceSeconds:    nil, // full available history by default; set explicitly to bound it
+		PodResyncPeriod: nil, // defaultPodResyncPeriod; set to 0 to disable resyncs
 		ReconnectBackoff: ReconnectBackoffConfig{
 			InitialInterval: 1 * time.Second,
 			MaxInterval:     30 * time.Second,

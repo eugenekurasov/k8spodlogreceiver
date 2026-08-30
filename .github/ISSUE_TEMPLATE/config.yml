@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Configuration reference
+    url: https://github.com/eugenekurasov/k8spodlogreceiver#configuration-reference
+    about: Every configuration field, with defaults and tuning guidance.
+  - name: Troubleshooting
+    url: https://github.com/eugenekurasov/k8spodlogreceiver#troubleshooting
+    about: Symptom-to-cause table for the common failure modes.

@@ -1,0 +1,53 @@
+name: Lint
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Cache vendor
+        id: cache-vendor
+        uses: actions/cache@v6
+        with:
+          path: vendor
+          key: ${{ runner.os }}-go-vendor-${{ hashFiles('go.sum') }}
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+
+      - uses: golangci/golangci-lint-action@v9
+
+  license-headers:
+    name: License headers
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+
+      - name: Install addlicense
+        run: go install github.com/google/addlicense@latest
+
+      - name: Check SPDX headers on hand-written Go files
+        run: |
+          # mdatagen-generated files carry no header upstream either, and
+          # regeneration would drop one, so they are excluded.
+          find . -name '*.go' \
+            -not -path './build/*' \
+            -not -path './vendor/*' \
+            -not -name 'generated_*.go' \
+            -print0 | xargs -0 addlicense -check

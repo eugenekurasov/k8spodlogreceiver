@@ -18,7 +18,7 @@
 // nil-pointer-panics. We also add KubeconfigPath (AuthTypeKubeConfig can
 // point at an explicit kubeconfig file, not just the standard
 // KUBECONFIG-env/~/.kube/config loading chain upstream relies on).
-package k8sconfig // import "github.com/eugenekurasov/security-observability-stack/otel-components/k8spodlogreceiver/internal/k8sconfig"
+package k8sconfig // import "github.com/eugenekurasov/k8spodlogreceiver/internal/k8sconfig"
 
 import (
 	"errors"

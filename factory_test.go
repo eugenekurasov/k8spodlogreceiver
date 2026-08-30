@@ -1,3 +1,6 @@
+// Copyright 2026 Yevhenii Kurasov
+// SPDX-License-Identifier: Apache-2.0
+
 package k8spodlogreceiver
 
 import (
@@ -10,7 +13,7 @@ import (
 	"go.opentelemetry.io/collector/consumer/consumertest"
 	"go.opentelemetry.io/collector/receiver/receivertest"
 
-	"github.com/eugenekurasov/security-observability-stack/otel-components/k8spodlogreceiver/internal/metadata"
+	"github.com/eugenekurasov/k8spodlogreceiver/internal/metadata"
 )
 
 func TestNewFactory_Type(t *testing.T) {
@@ -23,7 +26,8 @@ func TestCreateDefaultConfig_Defaults(t *testing.T) {
 	cfg := createDefaultConfig().(*Config)
 
 	assert.Equal(t, AuthTypeServiceAccount, cfg.APIConfig.AuthType)
-	assert.Nil(t, cfg.SinceSeconds)
+	require.NotNil(t, cfg.SinceSeconds)
+	assert.Equal(t, int64(300), *cfg.SinceSeconds, "backfill is bounded by default")
 	assert.Equal(t, 1*time.Second, cfg.ReconnectBackoff.InitialInterval)
 	assert.Equal(t, 30*time.Second, cfg.ReconnectBackoff.MaxInterval)
 	assert.Equal(t, 5*time.Minute, cfg.ReconnectBackoff.MaxElapsedTime)

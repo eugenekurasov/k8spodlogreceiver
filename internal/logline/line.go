@@ -1,3 +1,6 @@
+// Copyright 2026 Yevhenii Kurasov
+// SPDX-License-Identifier: Apache-2.0
+
 // It is deliberately small and stanza-independent: this receiver streams via
 // the API server rather than tailing files, so it needs only a slice of what
 // pkg/stanza provides.

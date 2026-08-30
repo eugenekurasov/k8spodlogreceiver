@@ -1,3 +1,6 @@
+// Copyright 2026 Yevhenii Kurasov
+// SPDX-License-Identifier: Apache-2.0
+
 // Package k8spodlogreceiver implements an OpenTelemetry Collector receiver
 // that streams Kubernetes pod logs via the Kubernetes API server
 // (kubectl logs-style), avoiding the need for hostPath mounts or
@@ -11,9 +14,9 @@ import (
 
 	"go.opentelemetry.io/collector/component"
 
-	"github.com/eugenekurasov/security-observability-stack/otel-components/k8spodlogreceiver/internal/consumerretry"
-	"github.com/eugenekurasov/security-observability-stack/otel-components/k8spodlogreceiver/internal/k8sconfig"
-	"github.com/eugenekurasov/security-observability-stack/otel-components/k8spodlogreceiver/internal/logline"
+	"github.com/eugenekurasov/k8spodlogreceiver/internal/consumerretry"
+	"github.com/eugenekurasov/k8spodlogreceiver/internal/k8sconfig"
+	"github.com/eugenekurasov/k8spodlogreceiver/internal/logline"
 )
 
 // Config defines the user-facing configuration for the k8spodlog receiver.
@@ -35,12 +38,19 @@ type Config struct {
 	// new pod/container is first discovered (mirrors `kubectl logs
 	// --since`). Three states, distinguished via the pointer so "not set"
 	// and "explicitly zero" don't collide:
-	//   - nil (key absent from config): full available log history
-	//     (whatever the kubelet still has retained), no bound.
+	//   - pointer to N > 0: last N seconds of history. The factory default
+	//     is defaultSinceSeconds.
 	//   - pointer to 0: fresh logs only, no historical backfill.
-	//   - pointer to N > 0: last N seconds of history.
-	// Set an explicit bound in production to avoid a thundering-herd
-	// re-read of full available log history on collector restart.
+	//   - nil: no bound at all — read whatever the kubelet still retains.
+	//
+	// Only the first two are reachable through configuration. Because the
+	// factory default is non-nil, confmap has nothing to clear it with:
+	// omitting the key leaves the default in place, and `since_seconds:
+	// null` does not reset it either. nil therefore remains an internal
+	// state, used when a Config is built programmatically. Configuration
+	// asks for effectively-unbounded history with a large N instead, which
+	// is equivalent in practice since the kubelet only holds what it has
+	// retained.
 	SinceSeconds *int64 `mapstructure:"since_seconds"`
 
 	// PodResyncPeriod is how often the pod informer re-delivers every pod it
@@ -112,6 +122,14 @@ const (
 	// enough that walking the pod cache is negligible, short enough that a
 	// stream which gave up is not left dead for long.
 	defaultPodResyncPeriod = 10 * time.Minute
+
+	// defaultSinceSeconds bounds the backfill read when a container is first
+	// discovered. A bound is the default rather than unlimited history: on
+	// restart the receiver rediscovers every container at once, and an
+	// unbounded read would ask the kubelet for each one's full retained
+	// history simultaneously. Five minutes covers a collector restart or
+	// rollout without turning one into a thundering herd.
+	defaultSinceSeconds = int64(300)
 )
 
 // APIConfig controls how the receiver authenticates to the API server.

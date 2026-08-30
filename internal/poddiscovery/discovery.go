@@ -1,7 +1,10 @@
+// Copyright 2026 Yevhenii Kurasov
+// SPDX-License-Identifier: Apache-2.0
+
 // Package poddiscovery watches the Kubernetes API for pods and reports their
 // lifecycle to a handler. It owns the client-go informer machinery and
 // nothing else: it does not know what the caller does with a pod.
-package poddiscovery // import "github.com/eugenekurasov/security-observability-stack/otel-components/k8spodlogreceiver/internal/poddiscovery"
+package poddiscovery // import "github.com/eugenekurasov/k8spodlogreceiver/internal/poddiscovery"
 
 import (
 	"context"

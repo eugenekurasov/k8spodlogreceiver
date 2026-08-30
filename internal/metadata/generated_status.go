@@ -10,7 +10,7 @@ import (
 
 var (
 	Type      = component.MustNewType("k8s_pod_log")
-	ScopeName = "github.com/eugenekurasov/security-observability-stack/otel-components/k8spodlogreceiver"
+	ScopeName = "github.com/eugenekurasov/k8spodlogreceiver"
 )
 
 const (

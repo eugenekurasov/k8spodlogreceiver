@@ -1,0 +1,42 @@
+name: Feedback or question
+description: Ask a question, suggest an improvement, or share how it went in your cluster
+labels: ["question"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Questions, ideas, and reports of real-world use are all welcome here —
+        including "this worked fine, here is what my setup looks like".
+        Operational experience from clusters other than mine is genuinely
+        useful for deciding what to work on next.
+
+  - type: dropdown
+    id: kind
+    attributes:
+      label: What kind of issue is this?
+      options:
+        - Question about configuration or behaviour
+        - Feature idea
+        - Feedback on the documentation
+        - Report of real-world usage
+        - Something else
+    validations:
+      required: true
+
+  - type: textarea
+    id: body
+    attributes:
+      label: Details
+      description: |
+        For a question, include what you are trying to achieve — the underlying
+        goal often has a simpler answer than the specific question.
+    validations:
+      required: true
+
+  - type: textarea
+    id: context
+    attributes:
+      label: Context
+      description: |
+        Optional. Cluster size and distribution, how many namespaces you
+        collect from, deployment shape, and anything else that helps.

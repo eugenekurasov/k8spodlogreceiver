@@ -1,3 +1,6 @@
+// Copyright 2026 Yevhenii Kurasov
+// SPDX-License-Identifier: Apache-2.0
+
 package k8spodlogreceiver
 
 import (
@@ -24,11 +27,11 @@ import (
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 
-	"github.com/eugenekurasov/security-observability-stack/otel-components/k8spodlogreceiver/internal/consumerretry"
-	"github.com/eugenekurasov/security-observability-stack/otel-components/k8spodlogreceiver/internal/k8sconfig"
-	"github.com/eugenekurasov/security-observability-stack/otel-components/k8spodlogreceiver/internal/logline"
-	"github.com/eugenekurasov/security-observability-stack/otel-components/k8spodlogreceiver/internal/metadata"
-	"github.com/eugenekurasov/security-observability-stack/otel-components/k8spodlogreceiver/internal/poddiscovery"
+	"github.com/eugenekurasov/k8spodlogreceiver/internal/consumerretry"
+	"github.com/eugenekurasov/k8spodlogreceiver/internal/k8sconfig"
+	"github.com/eugenekurasov/k8spodlogreceiver/internal/logline"
+	"github.com/eugenekurasov/k8spodlogreceiver/internal/metadata"
+	"github.com/eugenekurasov/k8spodlogreceiver/internal/poddiscovery"
 )
 
 const (
@@ -191,8 +194,16 @@ func (r *logsReceiver) onPodAdded(ctx context.Context, pod *corev1.Pod) {
 
 // streamKey identifies one container's log stream in activeStreams and
 // terminatedContainers.
-func streamKey(namespace, podName, containerName string) string {
-	return namespace + "/" + podName + "/" + containerName
+//
+// The pod UID is part of the key, not just the name. A pod recreated under the
+// same name (a StatefulSet replacement, a rerun Job, a re-applied bare pod) is
+// a different pod, and sharing a key with its predecessor causes two distinct
+// faults: the outgoing stream's deferred cleanup would delete the incoming
+// pod's entry, leaving an untracked goroutine that a later sync would then
+// duplicate; and a terminal marker left by the old container would suppress
+// streaming for the new one entirely.
+func streamKey(namespace, podName, podUID, containerName string) string {
+	return namespace + "/" + podName + "/" + podUID + "/" + containerName
 }
 
 // podContainers lists every container the receiver should stream: init
@@ -230,7 +241,7 @@ func (r *logsReceiver) ensureStreams(ctx context.Context, pod *corev1.Pod) {
 		if !containerHasStarted(pod, container.Name) {
 			continue
 		}
-		key := streamKey(pod.Namespace, pod.Name, container.Name)
+		key := streamKey(pod.Namespace, pod.Name, string(pod.UID), container.Name)
 
 		r.mu.Lock()
 		if _, exists := r.activeStreams[key]; exists {
@@ -256,7 +267,7 @@ func (r *logsReceiver) onPodDeleted(pod *corev1.Pod) {
 
 	r.mu.Lock()
 	for _, container := range podContainers(pod) {
-		key := streamKey(pod.Namespace, pod.Name, container.Name)
+		key := streamKey(pod.Namespace, pod.Name, string(pod.UID), container.Name)
 		if cancel, ok := r.activeStreams[key]; ok {
 			cancel()
 			delete(r.activeStreams, key)
@@ -273,12 +284,12 @@ func (r *logsReceiver) markContainerStates(pod *corev1.Pod) {
 	defer r.mu.Unlock()
 	for _, cs := range pod.Status.ContainerStatuses {
 		if containerIsTerminal(pod.Spec.RestartPolicy, cs, false, nil) {
-			r.terminatedContainers[streamKey(pod.Namespace, pod.Name, cs.Name)] = struct{}{}
+			r.terminatedContainers[streamKey(pod.Namespace, pod.Name, string(pod.UID), cs.Name)] = struct{}{}
 		}
 	}
 	for _, cs := range pod.Status.InitContainerStatuses {
 		if containerIsTerminal(pod.Spec.RestartPolicy, cs, true, initContainerRestartPolicy(pod, cs.Name)) {
-			r.terminatedContainers[streamKey(pod.Namespace, pod.Name, cs.Name)] = struct{}{}
+			r.terminatedContainers[streamKey(pod.Namespace, pod.Name, string(pod.UID), cs.Name)] = struct{}{}
 		}
 	}
 }

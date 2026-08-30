@@ -1,3 +1,6 @@
+// Copyright 2026 Yevhenii Kurasov
+// SPDX-License-Identifier: Apache-2.0
+
 package k8spodlogreceiver
 
 import (
@@ -14,9 +17,9 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 
-	"github.com/eugenekurasov/security-observability-stack/otel-components/k8spodlogreceiver/internal/logline"
-	"github.com/eugenekurasov/security-observability-stack/otel-components/k8spodlogreceiver/internal/metadata"
-	"github.com/eugenekurasov/security-observability-stack/otel-components/k8spodlogreceiver/internal/retry"
+	"github.com/eugenekurasov/k8spodlogreceiver/internal/logline"
+	"github.com/eugenekurasov/k8spodlogreceiver/internal/metadata"
+	"github.com/eugenekurasov/k8spodlogreceiver/internal/retry"
 )
 
 // containerStream owns the log-follow loop of a single container: open a

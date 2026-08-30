@@ -10,7 +10,7 @@ import (
 	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 	"go.opentelemetry.io/otel/sdk/metric/metricdata/metricdatatest"
 
-	"github.com/eugenekurasov/security-observability-stack/otel-components/k8spodlogreceiver/internal/metadata"
+	"github.com/eugenekurasov/k8spodlogreceiver/internal/metadata"
 	"go.opentelemetry.io/collector/component/componenttest"
 )
 

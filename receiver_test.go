@@ -1,3 +1,6 @@
+// Copyright 2026 Yevhenii Kurasov
+// SPDX-License-Identifier: Apache-2.0
+
 package k8spodlogreceiver
 
 import (
@@ -20,10 +23,11 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 
-	"github.com/eugenekurasov/security-observability-stack/otel-components/k8spodlogreceiver/internal/logline"
-	"github.com/eugenekurasov/security-observability-stack/otel-components/k8spodlogreceiver/internal/metadata"
+	"github.com/eugenekurasov/k8spodlogreceiver/internal/logline"
+	"github.com/eugenekurasov/k8spodlogreceiver/internal/metadata"
 )
 
 func newTestReceiver() *logsReceiver {
@@ -48,10 +52,16 @@ func makePod(ns, name string, containers ...string) *corev1.Pod {
 		statuses[i] = runningStatus(c)
 	}
 	return &corev1.Pod{
-		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns, UID: types.UID(ns + "-" + name + "-uid")},
 		Spec:       corev1.PodSpec{Containers: specs},
 		Status:     corev1.PodStatus{ContainerStatuses: statuses},
 	}
+}
+
+// podKey builds the activeStreams/terminatedContainers key for a container of
+// pod, so tests do not restate the key format.
+func podKey(pod *corev1.Pod, container string) string {
+	return streamKey(pod.Namespace, pod.Name, string(pod.UID), container)
 }
 
 func TestOnPodAdded_RegistersStreamsPerContainer(t *testing.T) {
@@ -59,11 +69,12 @@ func TestOnPodAdded_RegistersStreamsPerContainer(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	r.onPodAdded(ctx, makePod("payments", "app-abc", "api", "sidecar"))
+	pod := makePod("payments", "app-abc", "api", "sidecar")
+	r.onPodAdded(ctx, pod)
 
 	r.mu.Lock()
-	_, hasAPI := r.activeStreams["payments/app-abc/api"]
-	_, hasSidecar := r.activeStreams["payments/app-abc/sidecar"]
+	_, hasAPI := r.activeStreams[podKey(pod, "api")]
+	_, hasSidecar := r.activeStreams[podKey(pod, "sidecar")]
 	r.mu.Unlock()
 
 	assert.True(t, hasAPI, "expected stream for 'api' container")
@@ -88,7 +99,7 @@ func TestUpdateStartsStreamsForNeverAddedPod(t *testing.T) {
 	r.ensureStreams(ctx, pod)
 
 	r.mu.Lock()
-	_, hasAPI := r.activeStreams["payments/app-abc/api"]
+	_, hasAPI := r.activeStreams[podKey(pod, "api")]
 	r.mu.Unlock()
 	assert.True(t, hasAPI, "an update must start streams for a pod that was never added")
 
@@ -109,14 +120,14 @@ func TestPodDeleted_CancelsStreamsFromTombstonedPod(t *testing.T) {
 	r.onPodAdded(ctx, pod)
 
 	r.mu.Lock()
-	_, live := r.activeStreams["payments/app-abc/api"]
+	_, live := r.activeStreams[podKey(pod, "api")]
 	r.mu.Unlock()
 	require.True(t, live, "stream must be running before the delete")
 
 	r.onPodDeleted(pod)
 
 	r.mu.Lock()
-	_, stillLive := r.activeStreams["payments/app-abc/api"]
+	_, stillLive := r.activeStreams[podKey(pod, "api")]
 	r.mu.Unlock()
 	assert.False(t, stillLive, "a tombstoned pod's streams must be cancelled")
 
@@ -165,18 +176,19 @@ func TestOnPodAdded_Deduplicates(t *testing.T) {
 
 func TestOnPodDeleted_CancelsAndRemovesStream(t *testing.T) {
 	cancelled := false
+	pod := makePod("default", "worker", "app")
 	r := &logsReceiver{
 		activeStreams: map[string]context.CancelFunc{
-			"default/worker/app": func() { cancelled = true },
+			podKey(pod, "app"): func() { cancelled = true },
 		},
 	}
 
-	r.onPodDeleted(makePod("default", "worker", "app"))
+	r.onPodDeleted(pod)
 
 	assert.True(t, cancelled, "cancel func must be called on pod delete")
 
 	r.mu.Lock()
-	_, stillPresent := r.activeStreams["default/worker/app"]
+	_, stillPresent := r.activeStreams[podKey(pod, "app")]
 	r.mu.Unlock()
 	assert.False(t, stillPresent, "entry must be removed from activeStreams")
 }
@@ -192,14 +204,15 @@ func TestOnPodDeleted_UnknownPod_NoPanic(t *testing.T) {
 
 func TestOnPodDeleted_MultiContainer(t *testing.T) {
 	cancelledA, cancelledB := false, false
+	pod := makePod("ns", "pod", "a", "b")
 	r := &logsReceiver{
 		activeStreams: map[string]context.CancelFunc{
-			"ns/pod/a": func() { cancelledA = true },
-			"ns/pod/b": func() { cancelledB = true },
+			podKey(pod, "a"): func() { cancelledA = true },
+			podKey(pod, "b"): func() { cancelledB = true },
 		},
 	}
 
-	r.onPodDeleted(makePod("ns", "pod", "a", "b"))
+	r.onPodDeleted(pod)
 
 	assert.True(t, cancelledA, "container-a stream must be cancelled")
 	assert.True(t, cancelledB, "container-b stream must be cancelled")
@@ -300,8 +313,8 @@ func TestMarkContainerStates_MultiContainerJob(t *testing.T) {
 
 	r.markContainerStates(pod)
 
-	assert.True(t, r.isContainerTerminal("batch/job-abc/worker"), "finished container must be terminal even though pod phase is Running")
-	assert.False(t, r.isContainerTerminal("batch/job-abc/helper"), "still-running container must not be terminal")
+	assert.True(t, r.isContainerTerminal(podKey(pod, "worker")), "finished container must be terminal even though pod phase is Running")
+	assert.False(t, r.isContainerTerminal(podKey(pod, "helper")), "still-running container must not be terminal")
 }
 
 func TestMarkContainerStates_RestartPolicyAlways_NeverTerminal(t *testing.T) {
@@ -313,7 +326,7 @@ func TestMarkContainerStates_RestartPolicyAlways_NeverTerminal(t *testing.T) {
 
 	r.markContainerStates(pod)
 
-	assert.False(t, r.isContainerTerminal("default/app-abc/app"), "Always container must keep following restarts")
+	assert.False(t, r.isContainerTerminal(podKey(pod, "app")), "Always container must keep following restarts")
 }
 
 func TestMarkContainerStates_OnFailure(t *testing.T) {
@@ -322,14 +335,14 @@ func TestMarkContainerStates_OnFailure(t *testing.T) {
 	pod.Spec.RestartPolicy = corev1.RestartPolicyOnFailure
 	pod.Status.ContainerStatuses = []corev1.ContainerStatus{terminatedStatus("task", 0)}
 	r.markContainerStates(pod)
-	assert.True(t, r.isContainerTerminal("default/job-of/task"), "OnFailure + exit 0 is terminal")
+	assert.True(t, r.isContainerTerminal(podKey(pod, "task")), "OnFailure + exit 0 is terminal")
 
 	r2 := newTestReceiver()
 	podFail := makePod("default", "job-of", "task")
 	podFail.Spec.RestartPolicy = corev1.RestartPolicyOnFailure
 	podFail.Status.ContainerStatuses = []corev1.ContainerStatus{terminatedStatus("task", 2)}
 	r2.markContainerStates(podFail)
-	assert.False(t, r2.isContainerTerminal("default/job-of/task"), "OnFailure + non-zero exit will restart, not terminal")
+	assert.False(t, r2.isContainerTerminal(podKey(podFail, "task")), "OnFailure + non-zero exit will restart, not terminal")
 }
 
 func TestMarkContainerStates_NativeSidecar(t *testing.T) {
@@ -342,7 +355,7 @@ func TestMarkContainerStates_NativeSidecar(t *testing.T) {
 
 	r.markContainerStates(pod)
 
-	assert.False(t, r.isContainerTerminal("mesh/app-abc/proxy"), "native sidecar must not be terminal on a Terminated status")
+	assert.False(t, r.isContainerTerminal(podKey(pod, "proxy")), "native sidecar must not be terminal on a Terminated status")
 }
 
 func TestMarkContainerStates_RegularInitContainer(t *testing.T) {
@@ -354,7 +367,50 @@ func TestMarkContainerStates_RegularInitContainer(t *testing.T) {
 
 	r.markContainerStates(pod)
 
-	assert.True(t, r.isContainerTerminal("default/app-abc/migrate"), "completed regular init container is terminal")
+	assert.True(t, r.isContainerTerminal(podKey(pod, "migrate")), "completed regular init container is terminal")
+}
+
+// A pod recreated under the same name is a different pod. Keys must not
+// collide, or the replacement inherits the predecessor's terminal marker and
+// is never streamed, and the predecessor's cleanup evicts the replacement's
+// stream entry.
+func TestStreamKey_RecreatedPodUnderSameNameIsDistinct(t *testing.T) {
+	old := makePod("default", "job-abc", "app")
+	recreated := makePod("default", "job-abc", "app")
+	recreated.UID = "a-different-uid"
+
+	require.NotEqual(t, podKey(old, "app"), podKey(recreated, "app"),
+		"same name but different UID must produce different keys")
+
+	// The old pod's container finished permanently.
+	r := newTestReceiver()
+	old.Spec.RestartPolicy = corev1.RestartPolicyNever
+	old.Status.ContainerStatuses = []corev1.ContainerStatus{terminatedStatus("app", 0)}
+	r.markContainerStates(old)
+	require.True(t, r.isContainerTerminal(podKey(old, "app")))
+
+	// The replacement must not inherit that state.
+	assert.False(t, r.isContainerTerminal(podKey(recreated, "app")),
+		"a recreated pod must not inherit the terminal marker of its predecessor")
+
+	// And the old pod's delete must not evict the replacement's stream.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	r.onPodAdded(ctx, recreated)
+	r.mu.Lock()
+	_, live := r.activeStreams[podKey(recreated, "app")]
+	r.mu.Unlock()
+	require.True(t, live, "replacement stream must be registered")
+
+	r.onPodDeleted(old)
+
+	r.mu.Lock()
+	_, stillLive := r.activeStreams[podKey(recreated, "app")]
+	r.mu.Unlock()
+	assert.True(t, stillLive, "deleting the predecessor must not cancel the replacement's stream")
+
+	cancel()
+	r.wg.Wait()
 }
 
 func TestIsContainerTerminal_Unknown_ReturnsFalse(t *testing.T) {
@@ -380,9 +436,9 @@ func TestEnsureStreams_CoversInitContainers(t *testing.T) {
 	r.onPodAdded(ctx, pod)
 
 	r.mu.Lock()
-	_, hasApp := r.activeStreams["mesh/app-abc/app"]
-	_, hasMigrate := r.activeStreams["mesh/app-abc/migrate"]
-	_, hasProxy := r.activeStreams["mesh/app-abc/proxy"]
+	_, hasApp := r.activeStreams[podKey(pod, "app")]
+	_, hasMigrate := r.activeStreams[podKey(pod, "migrate")]
+	_, hasProxy := r.activeStreams[podKey(pod, "proxy")]
 	r.mu.Unlock()
 
 	assert.True(t, hasApp, "main container stream expected")
@@ -402,10 +458,10 @@ func TestOnPodDeleted_ClearsTerminatedContainerEntries(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	r.onPodAdded(ctx, pod)
-	require.True(t, r.isContainerTerminal("default/job-abc/app"))
+	require.True(t, r.isContainerTerminal(podKey(pod, "app")))
 
 	r.onPodDeleted(pod)
-	assert.False(t, r.isContainerTerminal("default/job-abc/app"), "terminatedContainers entry must be cleared on delete")
+	assert.False(t, r.isContainerTerminal(podKey(pod, "app")), "terminatedContainers entry must be cleared on delete")
 
 	cancel()
 	r.wg.Wait()

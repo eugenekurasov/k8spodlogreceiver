@@ -1,3 +1,6 @@
+// Copyright 2026 Yevhenii Kurasov
+// SPDX-License-Identifier: Apache-2.0
+
 // Package k8spodlogreceiver collects Kubernetes pod logs by streaming them
 // through the Kubernetes API server (the same path `kubectl logs -f` uses),
 // instead of requiring a DaemonSet with a read-only host-root mount.

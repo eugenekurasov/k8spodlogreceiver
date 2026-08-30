@@ -1,0 +1,99 @@
+name: Bug report
+description: Something in the receiver behaves incorrectly
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to file a report.
+
+        Before opening an issue, please check
+        [Troubleshooting](https://github.com/eugenekurasov/k8spodlogreceiver#troubleshooting)
+        and [Known limitations](https://github.com/eugenekurasov/k8spodlogreceiver#known-limitations)
+        — several behaviours that look like bugs (duplicate records after a
+        refused batch, `pod_gone` bursts during a rollout, gaps after a long
+        disconnect) are documented trade-offs.
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What did you observe, and what did you expect instead?
+    validations:
+      required: true
+
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      description: Minimal steps that show the problem.
+      placeholder: |
+        1. Deploy the collector with the config below
+        2. Create a pod that ...
+        3. Observe ...
+    validations:
+      required: true
+
+  - type: input
+    id: receiver-version
+    attributes:
+      label: Receiver version
+      description: Release tag, or commit SHA if built from source.
+      placeholder: "v0.1.0"
+    validations:
+      required: true
+
+  - type: input
+    id: k8s-version
+    attributes:
+      label: Kubernetes version and distribution
+      description: Output of `kubectl version --short`, plus where it runs.
+      placeholder: "1.34.8, EKS (also seen on kind)"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: auth-type
+    attributes:
+      label: api_config.auth_type
+      options:
+        - serviceAccount
+        - kubeConfig
+    validations:
+      required: true
+
+  - type: textarea
+    id: config
+    attributes:
+      label: Collector configuration
+      description: The receiver section at minimum. Redact any secrets.
+      render: yaml
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant collector logs
+      description: |
+        Set `service.telemetry.logs.level: debug` if the cause is not obvious.
+        Redact pod names or namespaces if they are sensitive.
+      render: shell
+
+  - type: textarea
+    id: metrics
+    attributes:
+      label: Receiver telemetry (optional, but very helpful)
+      description: |
+        Values of `otelcol_active_log_streams` and
+        `otelcol_log_connection_errors_total` broken down by `reason`, if you
+        have them. These usually identify the problem immediately — see
+        [Interpreting the metrics](https://github.com/eugenekurasov/k8spodlogreceiver#interpreting-the-metrics).
+      render: shell
+
+  - type: input
+    id: scale
+    attributes:
+      label: Scale
+      description: Roughly how many pods and containers are being collected?
+      placeholder: "~400 containers across 3 namespaces"

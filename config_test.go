@@ -1,3 +1,6 @@
+// Copyright 2026 Yevhenii Kurasov
+// SPDX-License-Identifier: Apache-2.0
+
 package k8spodlogreceiver
 
 import (
@@ -5,6 +8,7 @@ import (
 	"time"
 
 	"go.opentelemetry.io/collector/component/componenttest"
+	"go.opentelemetry.io/collector/confmap"
 	"go.opentelemetry.io/collector/confmap/confmaptest"
 
 	"github.com/stretchr/testify/assert"
@@ -176,4 +180,26 @@ func TestConfigValidate_MaxLogSizeBehavior(t *testing.T) {
 
 	cfg := &Config{APIConfig: base, MaxLogSizeBehavior: "nonsense"}
 	assert.Error(t, cfg.Validate(), "an unknown behavior must be rejected")
+}
+
+func TestSinceSeconds_DefaultIsBounded(t *testing.T) {
+	cfg := createDefaultConfig().(*Config)
+	require.NotNil(t, cfg.SinceSeconds, "backfill must be bounded by default")
+	assert.Equal(t, int64(300), *cfg.SinceSeconds)
+}
+
+func TestSinceSeconds_ExplicitZeroMeansFreshOnly(t *testing.T) {
+	cfg := createDefaultConfig().(*Config)
+	require.NoError(t, confmap.NewFromStringMap(map[string]any{"since_seconds": 0}).Unmarshal(cfg))
+	require.NotNil(t, cfg.SinceSeconds)
+	assert.Equal(t, int64(0), *cfg.SinceSeconds)
+}
+
+// Each Config must own its default pointer; a shared one would let a mutation
+// in one receiver instance leak into every other.
+func TestSinceSeconds_DefaultPointerNotShared(t *testing.T) {
+	a := createDefaultConfig().(*Config)
+	b := createDefaultConfig().(*Config)
+	*a.SinceSeconds = 7
+	assert.Equal(t, int64(300), *b.SinceSeconds)
 }

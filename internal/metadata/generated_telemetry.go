@@ -13,11 +13,11 @@ import (
 )
 
 func Meter(settings component.TelemetrySettings) metric.Meter {
-	return settings.MeterProvider.Meter("github.com/eugenekurasov/security-observability-stack/otel-components/k8spodlogreceiver")
+	return settings.MeterProvider.Meter("github.com/eugenekurasov/k8spodlogreceiver")
 }
 
 func Tracer(settings component.TelemetrySettings) trace.Tracer {
-	return settings.TracerProvider.Tracer("github.com/eugenekurasov/security-observability-stack/otel-components/k8spodlogreceiver")
+	return settings.TracerProvider.Tracer("github.com/eugenekurasov/k8spodlogreceiver")
 }
 
 // TelemetryBuilder provides an interface for components to report telemetry

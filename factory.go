@@ -1,3 +1,6 @@
+// Copyright 2026 Yevhenii Kurasov
+// SPDX-License-Identifier: Apache-2.0
+
 package k8spodlogreceiver
 
 import (
@@ -8,9 +11,9 @@ import (
 	"go.opentelemetry.io/collector/consumer"
 	"go.opentelemetry.io/collector/receiver"
 
-	"github.com/eugenekurasov/security-observability-stack/otel-components/k8spodlogreceiver/internal/consumerretry"
-	"github.com/eugenekurasov/security-observability-stack/otel-components/k8spodlogreceiver/internal/logline"
-	"github.com/eugenekurasov/security-observability-stack/otel-components/k8spodlogreceiver/internal/metadata"
+	"github.com/eugenekurasov/k8spodlogreceiver/internal/consumerretry"
+	"github.com/eugenekurasov/k8spodlogreceiver/internal/logline"
+	"github.com/eugenekurasov/k8spodlogreceiver/internal/metadata"
 )
 
 func NewFactory() receiver.Factory {
@@ -22,11 +25,14 @@ func NewFactory() receiver.Factory {
 }
 
 func createDefaultConfig() component.Config {
+	// A per-call copy: a shared package-level pointer would let one
+	// receiver's config mutation leak into every other instance.
+	sinceSeconds := defaultSinceSeconds
 	return &Config{
 		APIConfig: APIConfig{
 			AuthType: AuthTypeServiceAccount,
 		},
-		SinceSeconds:    nil, // full available history by default; set explicitly to bound it
+		SinceSeconds:    &sinceSeconds, // bounded backfill; `since_seconds: null` opts into full history
 		PodResyncPeriod: nil, // defaultPodResyncPeriod; set to 0 to disable resyncs
 		ReconnectBackoff: ReconnectBackoffConfig{
 			InitialInterval: 1 * time.Second,

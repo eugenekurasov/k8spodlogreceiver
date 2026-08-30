@@ -1,0 +1,47 @@
+# NOTE:
+# This builder configuration is NOT used to build any official binary.
+# It assembles a local Collector containing this receiver, for development
+# and for the CI build check. To see the builder manifests used for official
+# binaries, check
+# https://github.com/open-telemetry/opentelemetry-collector-releases
+#
+# Build with:
+#   go install go.opentelemetry.io/collector/cmd/builder@v0.159.0
+#   builder --config builder-config.yaml
+
+dist:
+  module: github.com/eugenekurasov/k8spodlogreceiver/cmd/k8spodlogcollector
+  name: k8spodlogcollector
+  output_path: build
+  description: Local OpenTelemetry Collector binary, testing only.
+  version: 0.0.0-dev
+
+receivers:
+  - gomod: go.opentelemetry.io/collector/receiver/nopreceiver v0.159.0
+  - gomod: go.opentelemetry.io/collector/receiver/otlpreceiver v0.159.0
+  - gomod: github.com/eugenekurasov/k8spodlogreceiver v0.0.1
+    path: ./
+exporters:
+  - gomod: go.opentelemetry.io/collector/exporter/debugexporter v0.159.0
+  - gomod: go.opentelemetry.io/collector/exporter/nopexporter v0.159.0
+  - gomod: go.opentelemetry.io/collector/exporter/otlpexporter v0.159.0
+  - gomod: go.opentelemetry.io/collector/exporter/otlphttpexporter v0.159.0
+extensions:
+  - gomod: go.opentelemetry.io/collector/extension/memorylimiterextension v0.159.0
+  - gomod: go.opentelemetry.io/collector/extension/zpagesextension v0.159.0
+processors:
+  - gomod: go.opentelemetry.io/collector/processor/batchprocessor v0.159.0
+  - gomod: go.opentelemetry.io/collector/processor/memorylimiterprocessor v0.159.0
+connectors:
+  - gomod: go.opentelemetry.io/collector/connector/forwardconnector v0.159.0
+
+providers:
+  - gomod: go.opentelemetry.io/collector/confmap/provider/envprovider v1.65.0
+  - gomod: go.opentelemetry.io/collector/confmap/provider/fileprovider v1.65.0
+  - gomod: go.opentelemetry.io/collector/confmap/provider/httpprovider v1.65.0
+  - gomod: go.opentelemetry.io/collector/confmap/provider/httpsprovider v1.65.0
+  - gomod: go.opentelemetry.io/collector/confmap/provider/yamlprovider v1.65.0
+
+telemetry:
+  gomod: go.opentelemetry.io/collector/service v0.159.0
+  import: go.opentelemetry.io/collector/service/telemetry/otelconftelemetry

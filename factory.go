@@ -32,12 +32,19 @@ func createDefaultConfig() component.Config {
 		APIConfig: APIConfig{
 			AuthType: AuthTypeServiceAccount,
 		},
-		SinceSeconds:    &sinceSeconds, // bounded backfill; `since_seconds: null` opts into full history
-		PodResyncPeriod: nil, // defaultPodResyncPeriod; set to 0 to disable resyncs
+		SinceSeconds:      &sinceSeconds, // bounded backfill; `since_seconds: null` opts into full history
+		MaxStreamLifetime: defaultMaxStreamLifetime,
+		PodResyncPeriod:   nil, // defaultPodResyncPeriod; set to 0 to disable resyncs
 		ReconnectBackoff: ReconnectBackoffConfig{
 			InitialInterval: 1 * time.Second,
 			MaxInterval:     30 * time.Second,
-			MaxElapsedTime:  5 * time.Minute,
+			// 0 = retry for as long as the container is worth streaming.
+			// A finite cap would make recovery depend on PodResyncPeriod,
+			// which is slower than any sensible cap: a stream that gives up
+			// stays down until the next resync sweeps it back up. What should
+			// stop a stream is the container being gone or terminal, and both
+			// are event-driven and handled elsewhere — not a timer.
+			MaxElapsedTime: 0,
 		},
 		RetryOnFailure:     consumerretry.NewDefaultConfig(),
 		MaxBatchSize:       defaultMaxBatchSize,

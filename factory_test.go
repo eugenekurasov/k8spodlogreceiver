@@ -30,7 +30,8 @@ func TestCreateDefaultConfig_Defaults(t *testing.T) {
 	assert.Equal(t, int64(300), *cfg.SinceSeconds, "backfill is bounded by default")
 	assert.Equal(t, 1*time.Second, cfg.ReconnectBackoff.InitialInterval)
 	assert.Equal(t, 30*time.Second, cfg.ReconnectBackoff.MaxInterval)
-	assert.Equal(t, 5*time.Minute, cfg.ReconnectBackoff.MaxElapsedTime)
+	assert.Equal(t, time.Duration(0), cfg.ReconnectBackoff.MaxElapsedTime,
+		"retries are bounded by the container's lifetime, not by a timer")
 }
 
 func TestCreateDefaultConfig_Validates(t *testing.T) {

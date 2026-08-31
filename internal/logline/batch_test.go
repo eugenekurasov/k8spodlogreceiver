@@ -27,6 +27,9 @@ func TestBatch_AppendBuildsResourceAndRecords(t *testing.T) {
 	require.Equal(t, 1, logs.ResourceLogs().Len())
 	rl := logs.ResourceLogs().At(0)
 
+	// Deliberately literal, not semconv constants: these names are the wire
+	// contract every downstream consumer matches on, so bumping the semconv
+	// import must fail here rather than silently rename what is emitted.
 	attrs := rl.Resource().Attributes()
 	ns, ok := attrs.Get("k8s.namespace.name")
 	require.True(t, ok)
@@ -41,6 +44,34 @@ func TestBatch_AppendBuildsResourceAndRecords(t *testing.T) {
 	rec := rl.ScopeLogs().At(0).LogRecords().At(0)
 	assert.Equal(t, "hello world", rec.Body().Str())
 	assert.True(t, rec.Timestamp().AsTime().Equal(ts))
+}
+
+// The full attribute set, including the two the test above does not cover, and
+// the schema URL that says which version of the conventions they follow.
+func TestBatch_ResourceCarriesFullSemanticConventions(t *testing.T) {
+	b := NewBatch(Meta{
+		Namespace:     "payments",
+		PodName:       "app-abc",
+		PodUID:        "abc-123-uid",
+		ContainerName: "api",
+		NodeName:      "node-7",
+		RestartCount:  4,
+	})
+
+	rl := b.Logs().ResourceLogs().At(0)
+	assert.Equal(t, "https://opentelemetry.io/schemas/1.43.0", rl.SchemaUrl(),
+		"records must declare the conventions version they follow")
+
+	attrs := rl.Resource().Attributes()
+	node, ok := attrs.Get("k8s.node.name")
+	require.True(t, ok)
+	assert.Equal(t, "node-7", node.Str())
+
+	restarts, ok := attrs.Get("k8s.container.restart_count")
+	require.True(t, ok)
+	assert.Equal(t, int64(4), restarts.Int())
+
+	assert.Equal(t, 6, attrs.Len(), "no attribute may be added without documenting it in the README")
 }
 
 // A zero timestamp is backfilled with wall-clock time so no record is emitted

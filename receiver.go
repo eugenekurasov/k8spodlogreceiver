@@ -9,11 +9,13 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
 	"go.opentelemetry.io/collector/component"
 	"go.opentelemetry.io/collector/consumer"
+	"go.opentelemetry.io/collector/consumer/consumererror"
 	"go.opentelemetry.io/collector/pdata/plog"
 	"go.opentelemetry.io/collector/receiver"
 	"go.opentelemetry.io/collector/receiver/receiverhelper"
@@ -49,15 +51,34 @@ type logsReceiver struct {
 	consumer consumer.Logs
 	// kubernetes.Interface instead of *kubernetes.Clientset so tests can
 	// inject fake.NewSimpleClientset() without a real API server.
-	clientset            kubernetes.Interface
-	httpClient           *http.Client
-	cancel               context.CancelFunc
-	wg                   sync.WaitGroup
-	mu                   sync.Mutex
-	activeStreams        map[string]context.CancelFunc
+	clientset     kubernetes.Interface
+	httpClient    *http.Client
+	cancel        context.CancelFunc
+	wg            sync.WaitGroup
+	mu            sync.Mutex
+	activeStreams map[string]streamHandle
+	// nextStreamGen hands each started stream a unique generation, so a
+	// stream that is winding down can only release its own bookkeeping.
+	nextStreamGen        uint64
 	terminatedContainers map[string]struct{}
+	// drainedContainers marks containers whose stream has already run to
+	// completion while the container was terminal — it has been drained, so
+	// nothing more will ever be written to it. It is what stops the next
+	// resync from reopening a stream for a dead container, over and over
+	// until the pod is deleted. Being terminal alone is not enough: a
+	// container that had already exited when the receiver first saw it (a
+	// completed init container, a short Job) still has logs nobody has read.
+	drainedContainers map[string]struct{}
+	// cursors is where each container's progress lives, along with its
+	// persistence and expiry; see cursorStore. It has its own lock and is
+	// safe to use without holding r.mu — r.mu is still taken around it where
+	// a write has to be fenced against the receiver's own state.
+	cursors *cursorStore
+	// restartCounts caches the restart count for each container, keyed by
+	// streamKey. Updated on each pod discovery event.
+	restartCounts map[string]int32
 	//It is a field so tests can substitute a no-op without a real API server.
-	startStream func(ctx context.Context, namespace, podName, podUID, containerName, key string)
+	startStream func(ctx context.Context, namespace, podName, podUID, containerName, nodeName, key string, gen uint64)
 	obsrep      *receiverhelper.ObsReport
 	telemetry   *metadata.TelemetryBuilder
 }
@@ -83,16 +104,29 @@ func newLogsReceiver(settings receiver.Settings, cfg *Config, c consumer.Logs) (
 		cfg:                  cfg,
 		settings:             settings,
 		consumer:             nextConsumer,
-		activeStreams:        make(map[string]context.CancelFunc),
+		activeStreams:        make(map[string]streamHandle),
 		terminatedContainers: make(map[string]struct{}),
-		obsrep:               obsrep,
-		telemetry:            telemetryBuilder,
+		drainedContainers:    make(map[string]struct{}),
+		// Memory-only until Start resolves the configured storage extension.
+		cursors:       newCursorStore(nil, settings.Logger),
+		restartCounts: make(map[string]int32),
+		obsrep:        obsrep,
+		telemetry:     telemetryBuilder,
 	}
 	r.startStream = r.streamContainerLogs
 	return r, nil
 }
 
-func (r *logsReceiver) Start(ctx context.Context, _ component.Host) error {
+func (r *logsReceiver) Start(ctx context.Context, host component.Host) error {
+	client, err := openCursorStorage(ctx, host, r.cfg.StorageID, r.settings.ID)
+	if err != nil {
+		return fmt.Errorf("k8spodlogreceiver: %w", err)
+	}
+	// Replaced rather than mutated: nothing can have touched the memory-only
+	// store yet, since no stream exists before this point.
+	r.cursors = newCursorStore(client, r.settings.Logger)
+	r.cursors.load(ctx)
+
 	restCfg, err := k8sconfig.CreateRestConfig(r.cfg.APIConfig)
 	if err != nil {
 		return fmt.Errorf("k8spodlogreceiver: building kube client config: %w", err)
@@ -110,12 +144,20 @@ func (r *logsReceiver) Start(ctx context.Context, _ component.Host) error {
 	}
 	r.clientset = clientset
 
-	ctx, cancel := context.WithCancel(ctx)
+	runCtx, cancel := context.WithCancel(context.Background())
 	r.cancel = cancel
 
-	if err := r.startPodDiscovery(ctx); err != nil {
+	if err := r.startPodDiscovery(runCtx); err != nil {
 		cancel()
 		return fmt.Errorf("k8spodlogreceiver: starting pod discovery: %w", err)
+	}
+
+	r.wg.Add(1)
+	go r.runCursorPruning(runCtx)
+
+	if r.cursors.persists() {
+		r.wg.Add(1)
+		go r.runCursorFlush(runCtx)
 	}
 
 	r.settings.Logger.Info("started collecting pod logs",
@@ -136,7 +178,7 @@ func sinceForLog(sinceSeconds *int64) string {
 	return (time.Duration(*sinceSeconds) * time.Second).String()
 }
 
-func (r *logsReceiver) Shutdown(context.Context) error {
+func (r *logsReceiver) Shutdown(ctx context.Context) error {
 	if r.cancel != nil {
 		r.cancel()
 	}
@@ -147,6 +189,15 @@ func (r *logsReceiver) Shutdown(context.Context) error {
 	r.settings.Logger.Info("stopping pod log collection", zap.Int("draining_streams", draining))
 
 	r.wg.Wait()
+
+	// Written after every stream has stopped, so the persisted set includes
+	// each container's final delivered line. ctx here is the shutdown context,
+	// not the cancelled run context, so the write is still allowed to happen.
+	r.cursors.flush(ctx)
+	if err := r.cursors.close(ctx); err != nil {
+		r.settings.Logger.Warn("closing cursor storage", zap.Error(err))
+	}
+
 	if r.httpClient != nil {
 		// Not r.httpClient.CloseIdleConnections(): rest.HTTPClientFor wraps the
 		// *http.Transport in RoundTrippers (userAgent, auth) that don't implement
@@ -174,6 +225,7 @@ func (r *logsReceiver) startPodDiscovery(ctx context.Context) error {
 			// a stream that gave up (e.g. ReconnectBackoff.MaxElapsedTime):
 			// both calls below are idempotent.
 			OnUpdate: func(updateCtx context.Context, pod *corev1.Pod) {
+				r.recordPodUIDSeen(string(pod.UID))
 				r.markContainerStates(pod)
 				r.ensureStreams(updateCtx, pod)
 			},
@@ -188,8 +240,55 @@ func (r *logsReceiver) onPodAdded(ctx context.Context, pod *corev1.Pod) {
 		r.telemetry.PodDiscoveryEventsTotal.Add(ctx, 1, metric.WithAttributes(attribute.String("event_type", eventTypeAdded)))
 	}
 
+	r.recordPodUIDSeen(string(pod.UID))
 	r.markContainerStates(pod)
 	r.ensureStreams(ctx, pod)
+}
+
+// streamHandle is the bookkeeping for one running stream: how to stop it, and
+// which generation of that stream it is. The generation exists because a key
+// can legitimately be reused by a *later* stream for the same pod and
+// container — an informer that loses its watch reports a
+// DeletedFinalStateUnknown tombstone, and the following relist re-adds the very
+// same pod, UID included. The delete tears the old stream down and the re-add
+// starts a new one, while the old goroutine is still unwinding. Without a
+// generation its deferred cleanup would evict the replacement's entry, leaving
+// a stream that nothing tracks: no cancel on pod deletion, and a duplicate
+// started by the next sync that finds the key missing.
+type streamHandle struct {
+	cancel context.CancelFunc
+	gen    uint64
+}
+
+// releaseStream drops the bookkeeping for a finished stream, but only if the
+// entry still belongs to it. See streamHandle for why that check is needed.
+//
+// The gauge is re-recorded here and not only on pod events, because a stream
+// can end on its own: a terminal container, an exhausted MaxElapsedTime, a
+// cancelled parent. Without this, active_log_streams would stay overstated
+// until the next add/delete for some pod happened to correct it.
+func (r *logsReceiver) releaseStream(ctx context.Context, key string, gen uint64) {
+	r.mu.Lock()
+	released := false
+	if h, ok := r.activeStreams[key]; ok && h.gen == gen {
+		delete(r.activeStreams, key)
+		released = true
+		// The stream reached the end of a container that will never write
+		// again, so there is nothing left for a resync to reopen. Recorded
+		// only here, where the stream is known to have finished: a stream
+		// that stopped for any other reason (an exhausted MaxElapsedTime, a
+		// cancelled parent) must still be revived by the next resync.
+		if _, terminal := r.terminatedContainers[key]; terminal {
+			r.drainedContainers[key] = struct{}{}
+		}
+	}
+	r.mu.Unlock()
+
+	if released {
+		// ctx is this stream's own context and is usually already cancelled by
+		// the time the cleanup runs; the gauge must be recorded regardless.
+		r.recordActiveStreams(context.WithoutCancel(ctx))
+	}
 }
 
 // streamKey identifies one container's log stream in activeStreams and
@@ -204,6 +303,20 @@ func (r *logsReceiver) onPodAdded(ctx context.Context, pod *corev1.Pod) {
 // streaming for the new one entirely.
 func streamKey(namespace, podName, podUID, containerName string) string {
 	return namespace + "/" + podName + "/" + podUID + "/" + containerName
+}
+
+// podUIDFromStreamKey recovers the pod UID from a key built by streamKey, and
+// returns "" for anything else. It is how a cursor restored from storage — the
+// only place keys outlive the pod they came from — is matched back to its pod.
+//
+// None of the four segments can contain a slash: namespaces, pod names and
+// container names are DNS labels, and a UID is hexadecimal.
+func podUIDFromStreamKey(key string) string {
+	parts := strings.Split(key, "/")
+	if len(parts) != 4 {
+		return ""
+	}
+	return parts[2]
 }
 
 // podContainers lists every container the receiver should stream: init
@@ -248,18 +361,30 @@ func (r *logsReceiver) ensureStreams(ctx context.Context, pod *corev1.Pod) {
 			r.mu.Unlock()
 			continue
 		}
+		if _, drained := r.drainedContainers[key]; drained {
+			r.mu.Unlock()
+			continue
+		}
 		streamCtx, streamCancel := context.WithCancel(ctx)
-		r.activeStreams[key] = streamCancel
+		r.nextStreamGen++
+		gen := r.nextStreamGen
+		r.activeStreams[key] = streamHandle{cancel: streamCancel, gen: gen}
 		r.mu.Unlock()
 
 		r.wg.Add(1)
-		go r.startStream(streamCtx, pod.Namespace, pod.Name, string(pod.UID), container.Name, key)
+		go r.startStream(streamCtx, pod.Namespace, pod.Name, string(pod.UID), container.Name, pod.Spec.NodeName, key, gen)
 	}
 
 	r.recordActiveStreams(ctx)
 }
 
-func (r *logsReceiver) onPodDeleted(pod *corev1.Pod) {
+// onPodDeleted stops the pod's streams. inferred says whether the delete was
+// reported by the API server or only deduced by the informer after a broken
+// watch; see poddiscovery.Handler.OnDelete. A real delete means the pod is
+// gone and its cursors are dead weight. An inferred one means the very same
+// pod is probably about to be relisted and re-added, so the cursors are kept
+// and the replacement streams resume instead of re-reading the backfill.
+func (r *logsReceiver) onPodDeleted(pod *corev1.Pod, inferred bool) {
 	ctx := context.Background()
 	if r.telemetry != nil {
 		r.telemetry.PodDiscoveryEventsTotal.Add(ctx, 1, metric.WithAttributes(attribute.String("event_type", eventTypeDeleted)))
@@ -268,11 +393,15 @@ func (r *logsReceiver) onPodDeleted(pod *corev1.Pod) {
 	r.mu.Lock()
 	for _, container := range podContainers(pod) {
 		key := streamKey(pod.Namespace, pod.Name, string(pod.UID), container.Name)
-		if cancel, ok := r.activeStreams[key]; ok {
-			cancel()
+		if h, ok := r.activeStreams[key]; ok {
+			h.cancel()
 			delete(r.activeStreams, key)
 		}
 		delete(r.terminatedContainers, key)
+		delete(r.drainedContainers, key)
+		if !inferred {
+			r.cursors.forget(key)
+		}
 	}
 	r.mu.Unlock()
 
@@ -283,13 +412,17 @@ func (r *logsReceiver) markContainerStates(pod *corev1.Pod) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	for _, cs := range pod.Status.ContainerStatuses {
+		key := streamKey(pod.Namespace, pod.Name, string(pod.UID), cs.Name)
+		r.restartCounts[key] = cs.RestartCount
 		if containerIsTerminal(pod.Spec.RestartPolicy, cs, false, nil) {
-			r.terminatedContainers[streamKey(pod.Namespace, pod.Name, string(pod.UID), cs.Name)] = struct{}{}
+			r.terminatedContainers[key] = struct{}{}
 		}
 	}
 	for _, cs := range pod.Status.InitContainerStatuses {
+		key := streamKey(pod.Namespace, pod.Name, string(pod.UID), cs.Name)
+		r.restartCounts[key] = cs.RestartCount
 		if containerIsTerminal(pod.Spec.RestartPolicy, cs, true, initContainerRestartPolicy(pod, cs.Name)) {
-			r.terminatedContainers[streamKey(pod.Namespace, pod.Name, string(pod.UID), cs.Name)] = struct{}{}
+			r.terminatedContainers[key] = struct{}{}
 		}
 	}
 }
@@ -324,6 +457,37 @@ func initContainerRestartPolicy(pod *corev1.Pod, name string) *corev1.ContainerR
 	return nil
 }
 
+// cursorFor returns the last delivered timestamp for a container, zero if none.
+func (r *logsReceiver) cursorFor(key string) time.Time {
+	return r.cursors.get(key)
+}
+
+// advanceCursor records the last line delivered for a container, on behalf of
+// the stream generation gen.
+//
+// The write is fenced on that generation for the same reason releaseStream is:
+// a cancelled stream keeps running until it notices, and flushes its final
+// batch on the way out. Without the fence that late write would resurrect the
+// cursor of a pod that was really deleted — growing the persisted set forever
+// with entries for pods that no longer exist — or overwrite the cursor now
+// owned by a replacement stream.
+//
+// Zero timestamps and out-of-order writes are the store's business; see
+// cursorStore.advance.
+func (r *logsReceiver) advanceCursor(key string, gen uint64, ts time.Time) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	h, ok := r.activeStreams[key]
+	if !ok || h.gen != gen {
+		// This stream no longer owns the key: it was deleted or replaced.
+		return
+	}
+	// Called under r.mu so the fence and the write cannot be interleaved with
+	// a delete. The store never calls back here, so nothing can deadlock on it.
+	r.cursors.advance(key, ts)
+}
+
 func (r *logsReceiver) isContainerTerminal(key string) bool {
 	r.mu.Lock()
 	_, terminal := r.terminatedContainers[key]
@@ -341,20 +505,70 @@ func (r *logsReceiver) recordActiveStreams(ctx context.Context) {
 	r.telemetry.ActiveLogStreams.Record(ctx, count)
 }
 
-func (r *logsReceiver) streamContainerLogs(ctx context.Context, namespace, podName, podUID, containerName, key string) {
-	defer r.wg.Done()
-	defer func() {
-		r.mu.Lock()
-		delete(r.activeStreams, key)
-		r.mu.Unlock()
-	}()
+func (r *logsReceiver) getRestartCount(key string) int32 {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.restartCounts[key]
+}
 
-	r.newContainerStream(namespace, podName, podUID, containerName, key).run(ctx)
+// recordPodUIDSeen marks a pod UID as recently seen, deferring the expiry of
+// its containers' cursors.
+func (r *logsReceiver) recordPodUIDSeen(podUID string) {
+	r.cursors.markPodSeen(podUID)
+}
+
+// runCursorPruning expires the cursors of pods that are long gone, until ctx
+// is cancelled.
+func (r *logsReceiver) runCursorPruning(ctx context.Context) {
+	defer r.wg.Done()
+
+	ticker := time.NewTicker(cursorPruneInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			r.pruneStaleCursors()
+		}
+	}
+}
+
+// pruneStaleCursors expires the cursors of pods the informer has not reported
+// for cursorStaleAfter, and drops the receiver's own per-container state for
+// the same keys so the two cannot drift apart.
+func (r *logsReceiver) pruneStaleCursors() {
+	pruned := r.cursors.prune(time.Now().Add(-cursorStaleAfter))
+	if len(pruned) == 0 {
+		return
+	}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for _, key := range pruned {
+		delete(r.restartCounts, key)
+		delete(r.terminatedContainers, key)
+		delete(r.drainedContainers, key)
+	}
+}
+
+// runCursorFlush persists cursors periodically until ctx is cancelled.
+func (r *logsReceiver) runCursorFlush(ctx context.Context) {
+	defer r.wg.Done()
+	r.cursors.runFlushLoop(ctx)
+}
+
+func (r *logsReceiver) streamContainerLogs(ctx context.Context, namespace, podName, podUID, containerName, nodeName, key string, gen uint64) {
+	defer r.wg.Done()
+	defer r.releaseStream(ctx, key, gen)
+
+	r.newContainerStream(namespace, podName, podUID, containerName, nodeName, key, gen).run(ctx)
 }
 
 // newContainerStream wires a containerStream with everything it needs from
 // the receiver, so the stream itself holds no reference back to it.
-func (r *logsReceiver) newContainerStream(namespace, podName, podUID, containerName, key string) *containerStream {
+func (r *logsReceiver) newContainerStream(namespace, podName, podUID, containerName, nodeName, key string, gen uint64) *containerStream {
 	return &containerStream{
 		client:    r.clientset,
 		telemetry: r.telemetry,
@@ -363,6 +577,8 @@ func (r *logsReceiver) newContainerStream(namespace, podName, podUID, containerN
 			PodName:       podName,
 			PodUID:        podUID,
 			ContainerName: containerName,
+			NodeName:      nodeName,
+			RestartCount:  r.getRestartCount(key),
 		},
 		logger: r.settings.Logger.With(
 			zap.String("namespace", namespace),
@@ -370,18 +586,21 @@ func (r *logsReceiver) newContainerStream(namespace, podName, podUID, containerN
 			zap.String("container", containerName),
 			zap.String("podUID", podUID),
 		),
-		sinceSeconds: r.cfg.SinceSeconds,
-		backoffCfg:   r.cfg.ReconnectBackoff,
-		consume:      r.streamConnection,
-		isTerminal:   func() bool { return r.isContainerTerminal(key) },
-		backoff:      r.cfg.ReconnectBackoff.InitialInterval,
-		firstAttempt: true,
+		resumeFrom:        r.cursorFor(key),
+		onDelivered:       func(ts time.Time) { r.advanceCursor(key, gen, ts) },
+		sinceSeconds:      r.cfg.SinceSeconds,
+		backoffCfg:        r.cfg.ReconnectBackoff,
+		maxStreamLifetime: r.cfg.MaxStreamLifetime,
+		consume:           r.streamConnection,
+		isTerminal:        func() bool { return r.isContainerTerminal(key) },
+		backoff:           r.cfg.ReconnectBackoff.InitialInterval,
+		firstAttempt:      true,
 	}
 }
 
 var errPipelineRefused = errors.New("pipeline refused a batch; reconnecting to re-read it")
 
-func (r *logsReceiver) streamConnection(ctx context.Context, stream io.Reader, m logline.Meta) (lastTS time.Time, _ error) {
+func (r *logsReceiver) streamConnection(ctx context.Context, stream io.Reader, m logline.Meta, onProgress func(time.Time)) (lastTS time.Time, _ error) {
 	maxBatch := r.batchSize()
 	flushInterval := r.flushInterval()
 
@@ -427,20 +646,37 @@ func (r *logsReceiver) streamConnection(ctx context.Context, stream io.Reader, m
 		if batch.Count() == 0 {
 			return true
 		}
-		delivered := r.consumeBatch(ctx, batch.Logs(), batch.Count())
-		if delivered && !batchMaxTS.IsZero() {
+		outcome := r.consumeBatch(ctx, batch.Logs(), batch.Count())
+		// A dropped batch advances the cursor exactly like a delivered one:
+		// those records are gone either way, and leaving the cursor behind
+		// them would make the next connection re-read them forever.
+		if outcome != batchRefused && !batchMaxTS.IsZero() {
 			lastTS = batchMaxTS
+			// Reported per delivered batch, not once the connection ends: a
+			// healthy stream stays open for max_stream_lifetime, and a cursor
+			// that only advanced on disconnect would persist an hour-old
+			// position and re-read all of it after an abrupt restart.
+			if onProgress != nil {
+				onProgress(lastTS)
+			}
 		}
 		batch = logline.NewBatch(m)
 		batchMaxTS = time.Time{}
-		return delivered
+		return outcome != batchRefused
 	}
 
 	for {
 		select {
 		case item, ok := <-lineCh:
 			if !ok {
-				flush() // stream is over; nothing left to re-read from
+				// EOF, so readErr is usually nil — but a refused final batch
+				// must still be reported as one. Reporting it as a clean end
+				// would drop those lines for good: the caller only reconnects
+				// (live container) or drains the rest of a terminal
+				// container's log (follow) when the stream ended in error.
+				if !flush() {
+					return lastTS, errPipelineRefused
+				}
 				return lastTS, readErr
 			}
 			batch.Append(item.Body, item.Timestamp)
@@ -461,7 +697,23 @@ func (r *logsReceiver) streamConnection(ctx context.Context, stream io.Reader, m
 	}
 }
 
-func (r *logsReceiver) consumeBatch(ctx context.Context, logs plog.Logs, count int) bool {
+// batchOutcome is what the pipeline did with one batch, which decides whether
+// the stream may move past it.
+type batchOutcome int
+
+const (
+	// batchDelivered: accepted, the cursor may advance.
+	batchDelivered batchOutcome = iota
+	// batchRefused: rejected for now — a recoverable error, or retries that
+	// ran out of time. Re-reading it after a reconnect is the only way it can
+	// still be delivered, so the cursor must not move.
+	batchRefused
+	// batchDropped: rejected for good (consumererror.IsPermanent). Re-reading
+	// it would produce the identical error, so the cursor moves past it.
+	batchDropped
+)
+
+func (r *logsReceiver) consumeBatch(ctx context.Context, logs plog.Logs, count int) batchOutcome {
 	consumeCtx := ctx
 	if r.obsrep != nil {
 		consumeCtx = r.obsrep.StartLogsOp(consumeCtx)
@@ -470,11 +722,29 @@ func (r *logsReceiver) consumeBatch(ctx context.Context, logs plog.Logs, count i
 	if r.obsrep != nil {
 		r.obsrep.EndLogsOp(consumeCtx, "k8s_pod_log", count, err)
 	}
-	if err != nil {
-		r.settings.Logger.Error("failed to forward log records to pipeline", zap.Error(err))
-		return false
+	if err == nil {
+		return batchDelivered
 	}
-	return true
+
+	// A permanent error is the pipeline saying the data itself is
+	// unacceptable, not that it is busy — a processor rejecting a malformed
+	// record, an exporter refusing a payload it can never encode. Reconnecting
+	// re-reads the very same records and earns the very same error, forever:
+	// the connect succeeds, so the reconnect backoff is reset every round and
+	// the receiver spins at roughly one request per second per container
+	// without ever making progress. Dropping the batch and moving past it is
+	// the only outcome that terminates. It is already counted as refused
+	// records by obsrep.
+	if consumererror.IsPermanent(err) {
+		r.settings.Logger.Error("pipeline permanently refused log records; dropping them and moving on",
+			zap.Error(err),
+			zap.Int("dropped_records", count),
+		)
+		return batchDropped
+	}
+
+	r.settings.Logger.Error("failed to forward log records to pipeline", zap.Error(err))
+	return batchRefused
 }
 
 func (r *logsReceiver) podResyncPeriod() time.Duration {

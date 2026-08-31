@@ -19,7 +19,7 @@ dist:
 receivers:
   - gomod: go.opentelemetry.io/collector/receiver/nopreceiver v0.159.0
   - gomod: go.opentelemetry.io/collector/receiver/otlpreceiver v0.159.0
-  - gomod: github.com/eugenekurasov/k8spodlogreceiver v0.0.1
+  - gomod: github.com/eugenekurasov/k8spodlogreceiver v0.1.0
     path: ./
 exporters:
   - gomod: go.opentelemetry.io/collector/exporter/debugexporter v0.159.0
@@ -29,6 +29,7 @@ exporters:
 extensions:
   - gomod: go.opentelemetry.io/collector/extension/memorylimiterextension v0.159.0
   - gomod: go.opentelemetry.io/collector/extension/zpagesextension v0.159.0
+  - gomod: github.com/open-telemetry/opentelemetry-collector-contrib/extension/storage/filestorage v0.159.0
 processors:
   - gomod: go.opentelemetry.io/collector/processor/batchprocessor v0.159.0
   - gomod: go.opentelemetry.io/collector/processor/memorylimiterprocessor v0.159.0

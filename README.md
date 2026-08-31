@@ -131,8 +131,8 @@ k8spodlog-collector`. The examples below use these names — substitute your own
 
 ### RBAC
 
-The receiver needs two permissions: `get`/`list`/`watch` on `pods` (the
-discovery informer) and `get` on `pods/log` (the log streams themselves).
+The receiver needs two permissions: `get`/`list`/`watch` on `pods` (pod
+discovery) and `get` on `pods/log` (the log streams themselves).
 Without them the API server returns 403 and the receiver reports
 `otelcol_log_connection_errors_total{reason="rbac_denied"}`.
 
@@ -184,6 +184,14 @@ share a `ResourceLogs` with these resource attributes:
 | `k8s.pod.name` | Pod name |
 | `k8s.pod.uid` | Pod UID — stable across a rename, distinguishes two pods that reuse a name |
 | `k8s.container.name` | Container name, including init containers and native sidecars |
+| `k8s.node.name` | Node name where the pod is running |
+| `k8s.container.restart_count` | Container restart count |
+
+The names come from the OpenTelemetry [semantic conventions for
+Kubernetes](https://opentelemetry.io/docs/specs/semconv/resource/k8s/), and the
+`ResourceLogs` carries the matching schema URL
+(`https://opentelemetry.io/schemas/1.43.0`), so a schema processor downstream
+can translate them if it targets a different version.
 
 The instrumentation scope name is
 `github.com/eugenekurasov/k8spodlogreceiver`.
@@ -217,6 +225,57 @@ Two fields are deliberately **not** set:
 For the metrics the receiver emits about *itself*, see
 [`documentation.md`](./documentation.md).
 
+## Cursors and restarts
+
+Each container stream tracks the timestamp of the last line it delivered, and
+resumes from there on reconnect rather than re-reading `since_seconds`. That
+cursor is per container, keyed by namespace, pod name, pod UID and container
+name, so two pods that reuse a name never share one.
+
+By default cursors live in memory. They survive a reconnect, and they survive a
+broken watch — a dropped connection to the API server does not cost every
+container its position and send them all back to re-read `since_seconds` at
+once. A pod the API server reports as deleted does discard its cursors, since
+that pod is not coming back.
+
+They do not survive a collector restart unless you point the receiver at a
+storage extension:
+
+```yaml
+extensions:
+  file_storage:
+    directory: /var/lib/otelcol/storage
+
+receivers:
+  k8s_pod_log:
+    storage: file_storage
+
+service:
+  extensions: [file_storage]
+  pipelines:
+    logs:
+      receivers: [k8s_pod_log]
+      exporters: [otlp]
+```
+
+All positions are kept under a single key in the extension.
+
+A container's cursor advances as each batch is accepted by the pipeline, not
+when its connection ends — otherwise a healthy stream, which stays open for up
+to `max_stream_lifetime`, would leave the cursor an hour behind. Positions are
+written to storage every 30 seconds while running, and again during shutdown
+after every stream has stopped, so a clean stop persists each container's final
+delivered line and an abrupt kill costs at most the last 30 seconds of
+progress. Storage problems are deliberately
+non-fatal at runtime: unreadable state is discarded with a warning and
+collection starts from `since_seconds`, because failing to start is worse than
+re-reading a bounded window.
+
+Expect a small overlap on resume in any case. `SinceTime` is truncated to
+whole seconds, so a line written in the same second as the cursor is read
+again. Resuming re-delivers a line or two rather than skipping any, which is
+the intended trade: duplicates are recoverable downstream, gaps are not.
+
 ## Configuration reference
 
 This section documents the receiver's full configuration surface. Every
@@ -233,6 +292,7 @@ receivers:
     namespaces: ["payments", "billing"]
     pod_label_selector: "app.kubernetes.io/part-of=payments-platform"
     since_seconds: 300
+    max_stream_lifetime: 1h
     reconnect_backoff:
       initial_interval: 1s
       max_interval: 30s
@@ -276,6 +336,14 @@ receivers:
   means all namespaces visible to the ServiceAccount's RBAC.
 - `pod_label_selector`: only watch pods matching this label selector, e.g.
   `"app.kubernetes.io/part-of=payments"`.
+- `storage`: the name of a
+  [storage extension](https://github.com/open-telemetry/opentelemetry-collector-contrib/tree/main/extension/storage)
+  used to persist read positions, so a restarted collector resumes each
+  container where it stopped instead of re-reading `since_seconds`. Unset
+  (default) keeps positions in memory only. Naming an extension that is not
+  configured on the collector fails at startup rather than silently degrading.
+  See [Cursors and restarts](#cursors-and-restarts).
+
 - `since_seconds` (default `300`): how far back into existing logs to read
   when a pod/container is first discovered (mirrors `kubectl logs --since`).
   - unset / key absent: `300` — the last five minutes, enough to cover a
@@ -290,24 +358,58 @@ receivers:
   and use a large value (a day, a year) if you want everything the kubelet
   still holds — there is no separate "unbounded" setting, and a value beyond
   the retention window is equivalent to one.
-- `pod_resync_period`: how often the pod informer re-delivers every pod it has
-  cached, which re-runs the receiver's stream bookkeeping. Because that
-  bookkeeping is idempotent, a resync doubles as a self-healing sweep: a
-  container stream that gave up (see `reconnect_backoff.max_elapsed_time`) is
-  started again on the next resync rather than waiting for that pod to change.
-  Resyncs are served from the informer's local cache and cost no API server
-  traffic. Three states:
+- `pod_resync_period`: how often every known pod is re-examined. A resync
+  doubles as a self-healing sweep: a container stream that gave up (see
+  `reconnect_backoff.max_elapsed_time`) is started again on the next one rather
+  than waiting for that pod to change. Resyncs are served from a local cache
+  and cost no API server traffic. Three states:
   - unset / key absent (default): 10 minutes.
   - `0`: no resync — streams start only on real pod events.
   - `N > 0`: resync every `N`.
-- `reconnect_backoff.initial_interval` / `max_interval` / `max_elapsed_time`:
-  exponential backoff applied when a log stream drops (pod restart, kubelet
-  log rotation, transient API server error) before reconnecting. The delay
-  starts at `initial_interval`, doubles each failed attempt, and is capped at
-  `max_interval`. `max_elapsed_time` bounds the total time spent retrying a
-  single stream through an unbroken run of failures: once it is exceeded the
-  receiver gives up on that stream (a successful reconnect resets the clock).
-  Set `max_elapsed_time: 0` to retry indefinitely. Independently of backoff, a
+- `max_stream_lifetime` (default `1h`, `0` disables): how long a single log
+  connection is followed before the receiver deliberately closes it and
+  reconnects from the last delivered line.
+
+  This exists because `reconnect_backoff` only reacts to *errors*. A
+  `pods/log?follow=true` connection can stay open and stop delivering — the
+  socket is healthy, nothing fails, so nothing triggers a reconnect and the
+  stream goes silently mute. `otelcol_active_log_streams` keeps counting it as
+  a live stream while no records arrive. Recycling on a schedule bounds how
+  long that can go unnoticed, at the cost of one reconnect per container per
+  interval. A recycle is not an error: it does not count toward
+  `otelcol_log_connection_errors_total`, does not consume backoff, and
+  reconnects immediately from the cursor rather than re-reading
+  `since_seconds`.
+
+  Each connection gives up a random slice of up to 10% of the cap — an hour
+  expires somewhere in [54m, 60m] — so streams started together do not all
+  recycle at the same instant. The value you configure stays an upper bound.
+
+- `reconnect_backoff.initial_interval` / `max_interval` / `max_elapsed_time`
+  (default `max_elapsed_time: 0`): exponential backoff applied when a log
+  stream drops (pod restart, kubelet log rotation, transient API server error)
+  before reconnecting. The delay ladder starts at `initial_interval`, doubles
+  each failed attempt, and is capped at `max_interval`.
+
+  Each wait is **jittered** over the upper half of its interval — a 4s rung
+  waits somewhere in [2s, 4s). Without that, a single event that drops every
+  stream at once (an API server rollout, a load balancer reaping idle
+  connections) has all of them retry on the same 1s, 2s, 4s marks, hammering
+  the API server in waves precisely when it can least absorb them. The lower
+  half of each interval is kept fixed rather than randomising over the whole
+  range, so a persistent outage still backs off instead of occasionally
+  retrying almost immediately.
+
+  `max_elapsed_time` bounds the total time spent retrying a single stream
+  through an unbroken run of failures; once exceeded the receiver gives up on
+  that stream, and a successful reconnect resets the clock. It defaults to `0`
+  — retry for as long as the container is worth streaming — because a stream
+  that gives up is only revived by the next `pod_resync_period` sweep. A
+  finite cap shorter than that period therefore leaves the container
+  uncollected for the remainder of the interval, turning a recoverable outage
+  into a longer one. If you do set a finite `max_elapsed_time`, keep it longer
+  than `pod_resync_period`. What genuinely stops a stream is the pod being
+  deleted or the container terminating, and both are handled below. Independently of backoff, a
   container's stream is always stopped when the pod is deleted or when that
   container has permanently terminated — evaluated per container from its own
   `ContainerStatus`, not from the pod's `Succeeded`/`Failed` phase, so a
@@ -346,6 +448,16 @@ receivers:
   logged at warn level as `pipeline refused a batch, reconnecting to re-read
   it`, which is a reliable signal that the pipeline cannot keep up with the
   configured stream count and batch size.
+
+  A **permanent** error is handled the opposite way: the pipeline is saying the
+  data itself is unacceptable — a malformed record, a payload an exporter can
+  never encode — not that it is busy, so re-reading it would only earn the same
+  error again. The batch is dropped and the stream reads on. It is logged at
+  error level as `pipeline permanently refused log records; dropping them and
+  moving on` with the record count, and counted in
+  `otelcol_receiver_refused_log_records`. This is the only path on which the
+  receiver discards data by itself; if you see it, the fix is in the pipeline,
+  not here.
   Disabling this restores drop-on-refusal, which loses data under memory
   pressure — it is on by default for that reason. This mirrors the
   `retry_on_failure` block the `filelog` receiver and the other stanza-based
@@ -389,72 +501,6 @@ receivers:
 The full field definitions live in [`config.go`](./config.go), with a
 working sample in [`testdata/config.yaml`](./testdata/config.yaml).
 
-## Running tests locally
-
-### Unit tests
-
-No external dependencies:
-
-```bash
-go test -v ./...
-```
-
-### Integration tests
-
-These run [`TestIntegration_LogsArrive`](./integration_test.go) against a
-real Kubernetes cluster — a pod is created that emits a marker log line,
-and the test asserts the receiver reads it back through the full
-watch → stream → consumer path.
-
-**Prerequisites**
-
-- [Docker Desktop](https://www.docker.com/products/docker-desktop/) (or
-  another local Docker daemon), running.
-- [`kind`](https://kind.sigs.k8s.io/), installed via Homebrew:
-
-  ```bash
-  brew install kind
-  ```
-
-- On macOS with Docker Desktop, the daemon socket isn't at the usual
-  `/var/run/docker.sock` — export `DOCKER_HOST` so `kind`/`docker` find it:
-
-  ```bash
-  export DOCKER_HOST="unix://$HOME/.docker/run/docker.sock"
-  ```
-
-**Create a cluster** (any recent `kindest/node` tag works — see
-[kind releases](https://github.com/kubernetes-sigs/kind/releases) for
-current ones):
-
-```bash
-kind create cluster --name k8spodlog-test --image kindest/node:v1.34.8
-```
-
-**Run the tests** (`-mod=vendor` needs a populated `vendor/` — run
-`go mod vendor` first if you don't already have one):
-
-```bash
-go mod vendor  # only if vendor/ doesn't already exist
-go test -v -mod=vendor -tags integration -timeout 180s ./...
-```
-
-`kind create cluster` sets `kind-k8spodlog-test` as your current
-`kubectl` context and merges it into `~/.kube/config`, which is what the
-test picks up by default (or set `KUBECONFIG` to point elsewhere).
-
-**Clean up** when done:
-
-```bash
-kind delete cluster --name k8spodlog-test
-```
-
-If you re-run the tests immediately after a previous run, you may see
-`object is being deleted: namespaces "k8spodlog-inttest" already exists`
-— that's just the previous run's namespace still terminating (Kubernetes
-namespace deletion isn't instant), not a real failure. Wait a few seconds
-and retry.
-
 ## Troubleshooting
 
 Each symptom below maps to a knob documented in the
@@ -468,12 +514,13 @@ explanation of any field named here. The receiver's own telemetry (the
 | `client-side throttling` warnings in collector logs | Reconnect attempts exceed client-go's rate limiter. Note this bounds *new* connections, not concurrently open streams. | Raise `api_config.kube_api_qps` and `kube_api_burst` |
 | `pipeline refused a batch, reconnecting to re-read it` (warn) | `retry_on_failure.max_elapsed_time` expired while the pipeline kept refusing — a reliable signal the pipeline can't keep up with the configured stream count and batch size | Lower `max_batch_size`, narrow `namespaces` / `pod_label_selector`, or scale the downstream pipeline |
 | `otelcol_log_connection_errors_total{reason="rbac_denied"}` climbing | The ServiceAccount lacks `get` on `pods/log`, or the pod is outside the namespaces its Role covers | Check the [RBAC](#rbac) grant |
-| `otelcol_log_connection_errors_total{reason="pod_gone"}` climbing | A connect attempt got `404` — the pod is gone but the informer's cache still lists it | Expected in bursts during rollouts; see [Interpreting the metrics](#interpreting-the-metrics) for when it isn't |
+| `otelcol_log_connection_errors_total{reason="pod_gone"}` climbing | A connect attempt got `404` — the pod is gone but the receiver's pod cache still lists it | Expected in bursts during rollouts; see [Interpreting the metrics](#interpreting-the-metrics) for when it isn't |
 | Memory growth while `memory_limiter` is shedding load | Each retrying stream holds its batch in memory: roughly `max_batch_size` x concurrently retrying streams | Keep `max_batch_size` modest when collecting cluster-wide |
 | Duplicate records after a refused batch | `SinceTime` is truncated to whole seconds when re-reading | Working as intended — duplicates are recoverable downstream, dropped records are not |
-| Large history re-read on every collector restart | No cursor persistence; discovery re-reads from `since_seconds` | Set an explicit `since_seconds` bound in production |
-| Duplicate records across collector replicas | `activeStreams` is in-process only, with no cross-replica coordination | Run a single replica — see [Known limitations](#known-limitations) |
-| A container's stream stopped and never resumed | `reconnect_backoff.max_elapsed_time` was exceeded for that stream | The next `pod_resync_period` sweep restarts it; set `max_elapsed_time: 0` to retry indefinitely |
+| Large history re-read on every collector restart | No `storage` extension configured, so cursors are memory-only | Configure `storage` — see [Cursors and restarts](#cursors-and-restarts) |
+| Duplicate records across collector replicas | Every replica discovers and streams the same pods; nothing coordinates them | Run a single replica — see [Known limitations](#known-limitations) |
+| A stream shows as active but delivers nothing | The connection stayed open but went mute — no error, so backoff never fires | Recycling handles it within `max_stream_lifetime`; lower it if an hour of silence is too long |
+| A container's stream stopped and never resumed | A finite `reconnect_backoff.max_elapsed_time` was exceeded for that stream | Only the next `pod_resync_period` sweep revives it — that is why the default is `0`; if you set a finite cap, keep it longer than the resync period |
 
 ### Interpreting the metrics
 
@@ -485,11 +532,11 @@ matched by `namespaces` and `pod_label_selector`. Compare it against
 either direction is the earliest signal available.
 
 The important subtlety: this gauge counts streams the receiver is *managing*,
-not streams that are *delivering*. A stream stays counted for the whole time
-it is failing and backing off — its bookkeeping entry is only released once
-the stream gives up entirely (`reconnect_backoff.max_elapsed_time`) or its pod
-is deleted. So the gauge alone cannot distinguish healthy from stuck. Read it
-against the error counter:
+not streams that are *delivering*. A stream stays counted for the whole time it
+is failing and backing off, and stops being counted the moment it ends — the
+container terminated, the stream gave up (`reconnect_backoff.max_elapsed_time`),
+or the pod was deleted. So the gauge alone cannot distinguish healthy from
+stuck. Read it against the error counter:
 
 | `active_log_streams` | `log_connection_errors_total` | Reading |
 |---|---|---|
@@ -498,14 +545,14 @@ against the error counter:
 | Below container count | Flat | Containers are matched but never streamed — check `pod_label_selector` and RBAC |
 | Below container count | Climbing `rbac_denied` | Streams are being refused and abandoned — the Role is too narrow |
 | Above container count | Any | Streams outliving their containers, or more than one replica running |
-| Zero, non-zero before | Any | The informer stopped delivering, or the selector no longer matches anything |
+| Zero, non-zero before | Any | Pod discovery stopped delivering, or the selector no longer matches anything |
 
 **`otelcol_log_connection_errors_total{reason="pod_gone"}`** is the one whose
 meaning genuinely depends on shape, so it is worth reading carefully. It is
 recorded when a connect attempt returns `404 NotFound`, which means the
 receiver tried to open a stream for a pod the API server no longer has. That
-is a race, not a fault: the informer's cache still lists a pod that has since
-been deleted.
+is a race, not a fault: the receiver's pod cache still lists a pod that has
+since been deleted.
 
 - **Bursts that decay** — normal. Every rollout, scale-down, or Job completion
   produces them. The pod-deleted event arrives shortly after and the stream is
@@ -561,16 +608,18 @@ network error, and is only interesting if it fails to decay.
   no-cursor-persistence limitation below, not this one.
 
 - **Previous container instance logs not recovered on restart**: when a
-  container restarts, logs from its prior instance are not backfilled. The
-  receiver streams only the current instance — it does not set
-  `Previous: true` in `PodLogOptions`, so it never requests the
-  `?previous=true` variant of the API server's pod log endpoint. Any lines
-  emitted by the crashed instance before the new stream attaches are lost.
-- **No cursor persistence across restarts**: reconnect position is held in
-memory (bounded by `since_seconds`); after a collector restart, history is
-  re-read within that window (possible duplicates) or lost beyond it. There
-  is no persistent checkpoint equivalent to `filelogreceiver`'s file offset
-  storage.
+  container restarts, only the current instance is streamed. The previous
+  instance's logs — which `kubectl logs --previous` can still show — are not
+  backfilled, so any lines the crashed instance emitted before the new stream
+  attaches are lost.
+- **Cursor durability is bounded by the flush interval**: with a `storage`
+  extension configured, read positions survive a restart — see
+  [Cursors and restarts](#cursors-and-restarts). They are written every 30
+  seconds and again on shutdown, so a clean stop loses nothing, while an
+  abrupt kill can lose up to 30 seconds of progress. That window is re-read
+  on the next start, producing duplicates rather than gaps. Without a
+  `storage` extension there is no checkpoint at all and every restart re-reads
+  `since_seconds`.
 - **stdout and stderr are indistinguishable**: the `pods/log` endpoint
   returns both streams merged, with no per-line marker identifying which one
   a line came from. The container runtime records it on disk, but the API
@@ -588,23 +637,8 @@ memory (bounded by `since_seconds`); after a collector restart, history is
   anyway. Cross-replica stream ownership (consistent-hash ring plus lease
   coordination) would be required for HA within a single scope.
 
-## Third-party code
+## Contributing
 
-Two packages are derived from `opentelemetry-collector-contrib` (Copyright
-The OpenTelemetry Authors, licensed Apache-2.0). Both live under an
-`internal/` path upstream, so Go's package visibility rules allow them to be
-imported only from within the contrib module tree — they are redistributed
-here with attribution rather than reimplemented, as Apache-2.0 permits. Each
-file carries the upstream copyright header and a note on how it diverges:
-
-- [`internal/consumerretry`](internal/consumerretry/logs.go) — a copy of
-  contrib's `internal/coreinternal/consumerretry`.
-- [`internal/k8sconfig`](internal/k8sconfig/config.go) — adapted from
-  contrib's `internal/k8sconfig` (`APIConfig`, `CreateRestConfig`).
-
-The files under `internal/metadata`, `internal/metadatatest`, and the
-`generated_*.go` files are produced by `mdatagen` from
-[`metadata.yaml`](metadata.yaml); regenerate them rather than editing them.
-
-All other code in this repository is original to it and licensed under
-Apache-2.0.
+Running the unit and integration tests, regenerating the `mdatagen` files, and
+the third-party code this repository carries are covered in
+[CONTRIBUTING.md](./CONTRIBUTING.md).

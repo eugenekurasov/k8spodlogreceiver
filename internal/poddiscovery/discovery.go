@@ -50,10 +50,13 @@ type Handler struct {
 	OnAdd    func(ctx context.Context, pod *corev1.Pod)
 	OnUpdate func(ctx context.Context, pod *corev1.Pod)
 
-	// OnDelete also fires for a delete the informer only inferred from a
-	// re-listing (its watch missed the event); the pod passed is then the last
-	// state the informer had cached.
-	OnDelete func(pod *corev1.Pod)
+	// OnDelete fires when a pod goes away. inferred distinguishes the two
+	// ways that is learned: false for a delete the API server actually
+	// reported, true for one the informer only deduced from a re-listing
+	// after its watch broke — the pod passed is then the last cached state,
+	// and it may well still exist. Callers that keep per-pod state need the
+	// difference: an inferred delete is not evidence the pod is gone.
+	OnDelete func(pod *corev1.Pod, inferred bool)
 }
 
 // Discovery runs one shared informer per configured namespace.
@@ -187,7 +190,8 @@ func (d *Discovery) newInformer(ctx context.Context, namespace string) (cache.Sh
 			deliver(newObj, func(pod *corev1.Pod) { d.handler.OnUpdate(ctx, pod) })
 		},
 		DeleteFunc: func(obj any) {
-			deliver(obj, d.handler.OnDelete)
+			_, inferred := obj.(cache.DeletedFinalStateUnknown)
+			deliver(obj, func(pod *corev1.Pod) { d.handler.OnDelete(pod, inferred) })
 		},
 	}); err != nil {
 		return nil, fmt.Errorf("registering pod event handler: %w", err)

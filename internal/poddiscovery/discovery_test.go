@@ -44,7 +44,7 @@ func (r *recorder) handler() Handler {
 	return Handler{
 		OnAdd:    func(_ context.Context, p *corev1.Pod) { r.added <- key(p) },
 		OnUpdate: func(_ context.Context, p *corev1.Pod) { r.updated <- key(p) },
-		OnDelete: func(p *corev1.Pod) { r.deleted <- key(p) },
+		OnDelete: func(p *corev1.Pod, _ bool) { r.deleted <- key(p) },
 	}
 }
 

@@ -130,7 +130,7 @@ func TestLoadConfig_Testdata(t *testing.T) {
 	assert.Equal(t, 40, cfg.APIConfig.KubeAPIBurst)
 	assert.Equal(t, 1*time.Second, cfg.ReconnectBackoff.InitialInterval)
 	assert.Equal(t, 30*time.Second, cfg.ReconnectBackoff.MaxInterval)
-	assert.Equal(t, 5*time.Minute, cfg.ReconnectBackoff.MaxElapsedTime)
+	assert.Equal(t, 5*time.Minute, cfg.ReconnectBackoff.MaxElapsedTime) // set explicitly in testdata/config.yaml
 	assert.Equal(t, 500, cfg.MaxBatchSize)
 	assert.Equal(t, 250*time.Millisecond, cfg.FlushInterval)
 	assert.Equal(t, 2097152, cfg.MaxLogSize)
@@ -202,4 +202,21 @@ func TestSinceSeconds_DefaultPointerNotShared(t *testing.T) {
 	b := createDefaultConfig().(*Config)
 	*a.SinceSeconds = 7
 	assert.Equal(t, int64(300), *b.SinceSeconds)
+}
+
+func TestMaxStreamLifetime_DefaultIsOneHour(t *testing.T) {
+	cfg := createDefaultConfig().(*Config)
+	assert.Equal(t, time.Hour, cfg.MaxStreamLifetime)
+}
+
+func TestMaxStreamLifetime_NegativeRejected(t *testing.T) {
+	cfg := createDefaultConfig().(*Config)
+	cfg.MaxStreamLifetime = -time.Second
+	require.Error(t, cfg.Validate())
+}
+
+func TestMaxStreamLifetime_ZeroAccepted(t *testing.T) {
+	cfg := createDefaultConfig().(*Config)
+	cfg.MaxStreamLifetime = 0
+	require.NoError(t, cfg.Validate(), "0 disables the cap and must be valid")
 }

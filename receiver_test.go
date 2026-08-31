@@ -6,6 +6,7 @@ package k8spodlogreceiver
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"strings"
 	"sync"
@@ -14,32 +15,54 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.opentelemetry.io/collector/component/componenttest"
 	"go.opentelemetry.io/collector/consumer"
+	"go.opentelemetry.io/collector/consumer/consumererror"
 	"go.opentelemetry.io/collector/consumer/consumertest"
 	"go.opentelemetry.io/collector/pdata/plog"
 	"go.opentelemetry.io/collector/receiver/receiverhelper"
 	"go.opentelemetry.io/collector/receiver/receivertest"
+	"go.opentelemetry.io/otel/sdk/metric/metricdata"
+	"go.opentelemetry.io/otel/sdk/metric/metricdata/metricdatatest"
+	"go.uber.org/zap"
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/types"
 
 	"github.com/eugenekurasov/k8spodlogreceiver/internal/logline"
 	"github.com/eugenekurasov/k8spodlogreceiver/internal/metadata"
+	"github.com/eugenekurasov/k8spodlogreceiver/internal/metadatatest"
 )
 
 func newTestReceiver() *logsReceiver {
 	r := &logsReceiver{
 		cfg:                  createDefaultConfig().(*Config),
-		activeStreams:        make(map[string]context.CancelFunc),
+		activeStreams:        make(map[string]streamHandle),
 		terminatedContainers: make(map[string]struct{}),
+		drainedContainers:    make(map[string]struct{}),
+		cursors:              newCursorStore(nil, zap.NewNop()),
+		restartCounts:        make(map[string]int32),
 	}
-	r.startStream = func(_ context.Context, _, _, _, _, _ string) {
+	r.startStream = func(_ context.Context, _, _, _, _, _, _ string, _ uint64) {
 		defer r.wg.Done()
 	}
 	return r
+}
+
+// seedCursor registers an active stream for key and records ts through the
+// normal fenced path, mirroring what a running stream does. It returns the
+// generation so a test can also write as a *stale* stream.
+func seedCursor(r *logsReceiver, key string, ts time.Time) uint64 {
+	r.mu.Lock()
+	r.nextStreamGen++
+	gen := r.nextStreamGen
+	r.activeStreams[key] = streamHandle{cancel: func() {}, gen: gen}
+	r.mu.Unlock()
+	r.advanceCursor(key, gen, ts)
+	return gen
 }
 
 // makePod builds a pod whose containers are already Running — the common
@@ -124,7 +147,7 @@ func TestPodDeleted_CancelsStreamsFromTombstonedPod(t *testing.T) {
 	r.mu.Unlock()
 	require.True(t, live, "stream must be running before the delete")
 
-	r.onPodDeleted(pod)
+	r.onPodDeleted(pod, true) // tombstone: informer only inferred the delete
 
 	r.mu.Lock()
 	_, stillLive := r.activeStreams[podKey(pod, "api")]
@@ -153,7 +176,7 @@ func TestOnPodAdded_Deduplicates(t *testing.T) {
 
 	var calls int
 	var mu sync.Mutex
-	r.startStream = func(ctx context.Context, _, _, _, _, _ string) {
+	r.startStream = func(ctx context.Context, _, _, _, _, _, _ string, _ uint64) {
 		mu.Lock()
 		calls++
 		mu.Unlock()
@@ -178,12 +201,13 @@ func TestOnPodDeleted_CancelsAndRemovesStream(t *testing.T) {
 	cancelled := false
 	pod := makePod("default", "worker", "app")
 	r := &logsReceiver{
-		activeStreams: map[string]context.CancelFunc{
-			podKey(pod, "app"): func() { cancelled = true },
+		activeStreams: map[string]streamHandle{
+			podKey(pod, "app"): {cancel: func() { cancelled = true }},
 		},
+		cursors: newCursorStore(nil, zap.NewNop()),
 	}
 
-	r.onPodDeleted(pod)
+	r.onPodDeleted(pod, false)
 
 	assert.True(t, cancelled, "cancel func must be called on pod delete")
 
@@ -195,10 +219,11 @@ func TestOnPodDeleted_CancelsAndRemovesStream(t *testing.T) {
 
 func TestOnPodDeleted_UnknownPod_NoPanic(t *testing.T) {
 	r := &logsReceiver{
-		activeStreams: make(map[string]context.CancelFunc),
+		activeStreams: make(map[string]streamHandle),
+		cursors:       newCursorStore(nil, zap.NewNop()),
 	}
 	require.NotPanics(t, func() {
-		r.onPodDeleted(makePod("default", "ghost", "app"))
+		r.onPodDeleted(makePod("default", "ghost", "app"), false)
 	})
 }
 
@@ -206,13 +231,14 @@ func TestOnPodDeleted_MultiContainer(t *testing.T) {
 	cancelledA, cancelledB := false, false
 	pod := makePod("ns", "pod", "a", "b")
 	r := &logsReceiver{
-		activeStreams: map[string]context.CancelFunc{
-			podKey(pod, "a"): func() { cancelledA = true },
-			podKey(pod, "b"): func() { cancelledB = true },
+		activeStreams: map[string]streamHandle{
+			podKey(pod, "a"): {cancel: func() { cancelledA = true }},
+			podKey(pod, "b"): {cancel: func() { cancelledB = true }},
 		},
+		cursors: newCursorStore(nil, zap.NewNop()),
 	}
 
-	r.onPodDeleted(pod)
+	r.onPodDeleted(pod, false)
 
 	assert.True(t, cancelledA, "container-a stream must be cancelled")
 	assert.True(t, cancelledB, "container-b stream must be cancelled")
@@ -246,7 +272,7 @@ func TestEnsureStreams_SkipsContainerThatNeverStarted(t *testing.T) {
 
 	var calls int
 	var mu sync.Mutex
-	r.startStream = func(_ context.Context, _, _, _, _, _ string) {
+	r.startStream = func(_ context.Context, _, _, _, _, _, _ string, _ uint64) {
 		mu.Lock()
 		calls++
 		mu.Unlock()
@@ -279,7 +305,7 @@ func TestEnsureStreams_StreamsCrashLoopingContainer(t *testing.T) {
 
 	var calls int
 	var mu sync.Mutex
-	r.startStream = func(_ context.Context, _, _, _, _, _ string) {
+	r.startStream = func(_ context.Context, _, _, _, _, _, _ string, _ uint64) {
 		mu.Lock()
 		calls++
 		mu.Unlock()
@@ -402,7 +428,7 @@ func TestStreamKey_RecreatedPodUnderSameNameIsDistinct(t *testing.T) {
 	r.mu.Unlock()
 	require.True(t, live, "replacement stream must be registered")
 
-	r.onPodDeleted(old)
+	r.onPodDeleted(old, false)
 
 	r.mu.Lock()
 	_, stillLive := r.activeStreams[podKey(recreated, "app")]
@@ -411,6 +437,168 @@ func TestStreamKey_RecreatedPodUnderSameNameIsDistinct(t *testing.T) {
 
 	cancel()
 	r.wg.Wait()
+}
+
+// A lost watch makes the informer report a DeletedFinalStateUnknown tombstone,
+// and the relist that follows re-adds the very same pod — same UID. The delete
+// tears the stream down and the re-add starts a new one while the old goroutine
+// is still unwinding. Its cleanup must not evict the replacement's entry.
+func TestReleaseStream_LateCleanupKeepsReplacementEntry(t *testing.T) {
+	r := newTestReceiver()
+
+	// Capture what each started stream was handed, and let the test decide
+	// when a stream "finishes".
+	type started struct {
+		key string
+		gen uint64
+	}
+	var mu sync.Mutex
+	var runs []started
+	r.startStream = func(_ context.Context, _, _, _, _, _, key string, gen uint64) {
+		defer r.wg.Done()
+		mu.Lock()
+		runs = append(runs, started{key, gen})
+		mu.Unlock()
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	pod := makePod("payments", "api-0", "api")
+	key := podKey(pod, "api")
+
+	r.ensureStreams(ctx, pod)
+	r.wg.Wait()
+	mu.Lock()
+	require.Len(t, runs, 1)
+	oldGen := runs[0].gen
+	mu.Unlock()
+
+	// Watch drops: tombstone delete for the same pod.
+	r.onPodDeleted(pod, false)
+
+	// Relist re-adds the identical pod, UID included.
+	r.ensureStreams(ctx, pod)
+	r.wg.Wait()
+	mu.Lock()
+	require.Len(t, runs, 2, "the re-add must start a replacement stream")
+	newGen := runs[1].gen
+	mu.Unlock()
+	require.NotEqual(t, oldGen, newGen, "each started stream needs its own generation")
+
+	r.mu.Lock()
+	_, present := r.activeStreams[key]
+	r.mu.Unlock()
+	require.True(t, present, "replacement must be registered")
+
+	// Only now does the original goroutine finish and run its cleanup.
+	r.releaseStream(ctx, key, oldGen)
+
+	r.mu.Lock()
+	h, stillPresent := r.activeStreams[key]
+	r.mu.Unlock()
+	assert.True(t, stillPresent, "late cleanup from the old stream must not evict the replacement")
+	assert.Equal(t, newGen, h.gen, "the surviving entry must be the replacement's")
+
+	// And the replacement's own cleanup still works.
+	r.releaseStream(ctx, key, newGen)
+	r.mu.Lock()
+	_, gone := r.activeStreams[key]
+	r.mu.Unlock()
+	assert.False(t, gone, "a stream must still be able to release its own entry")
+}
+
+// A broken watch surfaces as a tombstone delete followed by a relist add of
+// the same pod. The cursor must survive it, or every container re-reads its
+// whole since_seconds window at once — the thundering herd the bounded default
+// exists to prevent.
+func TestCursor_SurvivesInferredDeleteButNotRealOne(t *testing.T) {
+	pod := makePod("payments", "api-0", "api")
+	key := podKey(pod, "api")
+	delivered := time.Date(2026, 8, 30, 12, 0, 0, 0, time.UTC)
+
+	t.Run("inferred delete keeps the cursor", func(t *testing.T) {
+		r := newTestReceiver()
+		seedCursor(r, key, delivered)
+		r.onPodDeleted(pod, true)
+		assert.Equal(t, delivered, r.cursorFor(key),
+			"a delete the informer only inferred is not evidence the pod is gone")
+	})
+
+	t.Run("real delete drops the cursor", func(t *testing.T) {
+		r := newTestReceiver()
+		seedCursor(r, key, delivered)
+		r.onPodDeleted(pod, false)
+		assert.True(t, r.cursorFor(key).IsZero(),
+			"a reported delete means the pod is gone and its cursor is dead weight")
+	})
+}
+
+// A stream winding down can report its last line after a replacement has
+// already read further. The cursor must not rewind.
+func TestAdvanceCursor_NeverMovesBackwards(t *testing.T) {
+	r := newTestReceiver()
+	key := "ns/pod/uid/c"
+	later := time.Date(2026, 8, 30, 12, 5, 0, 0, time.UTC)
+	earlier := later.Add(-time.Minute)
+
+	gen := seedCursor(r, key, later)
+	r.advanceCursor(key, gen, earlier)
+	assert.Equal(t, later, r.cursorFor(key))
+
+	r.advanceCursor(key, gen, time.Time{})
+	assert.Equal(t, later, r.cursorFor(key), "a zero timestamp must not clear the cursor")
+}
+
+// The replacement stream must actually be seeded with the remembered cursor.
+func TestNewContainerStream_SeedsResumeFromCursor(t *testing.T) {
+	r := newTestReceiver()
+	r.settings = receivertest.NewNopSettings(metadata.Type)
+	key := streamKey("ns", "pod", "uid", "c")
+	delivered := time.Date(2026, 8, 30, 12, 0, 0, 0, time.UTC)
+	seedCursor(r, key, delivered)
+
+	cs := r.newContainerStream("ns", "pod", "uid", "c", "node", key, 99)
+	assert.Equal(t, delivered, cs.resumeFrom,
+		"a restarted stream must resume from the remembered cursor, not the backfill window")
+
+	fresh := r.newContainerStream("ns", "other", "uid2", "c", "node", streamKey("ns", "other", "uid2", "c"), 100)
+	assert.True(t, fresh.resumeFrom.IsZero(), "an unknown container starts from the backfill window")
+}
+
+// A cancelled stream keeps running until it notices, then flushes its final
+// batch. That late write must not resurrect the cursor of a pod that was
+// really deleted, or the persisted set grows forever with dead entries.
+func TestCursor_LateFlushFromStoppedStreamIsIgnored(t *testing.T) {
+	r := newTestReceiver()
+	pod := makePod("payments", "api-0", "api")
+	key := podKey(pod, "api")
+
+	gen := seedCursor(r, key, time.Date(2026, 8, 30, 12, 0, 0, 0, time.UTC))
+	r.onPodDeleted(pod, false)
+	require.True(t, r.cursorFor(key).IsZero(), "a real delete drops the cursor")
+
+	// The stream, still unwinding, delivers its last buffered batch.
+	r.advanceCursor(key, gen, time.Date(2026, 8, 30, 12, 0, 5, 0, time.UTC))
+	assert.True(t, r.cursorFor(key).IsZero(),
+		"a stream that no longer owns the key must not write to it")
+}
+
+// The same fence must stop a stale stream from overwriting the cursor its
+// replacement now owns.
+func TestCursor_StaleStreamCannotOverwriteReplacement(t *testing.T) {
+	r := newTestReceiver()
+	key := streamKey("ns", "pod", "uid", "c")
+
+	staleGen := seedCursor(r, key, time.Date(2026, 8, 30, 12, 0, 0, 0, time.UTC))
+
+	// A replacement takes the slot and reads further.
+	newer := time.Date(2026, 8, 30, 12, 1, 0, 0, time.UTC)
+	seedCursor(r, key, newer)
+
+	// The stale stream flushes even later data it read on its own connection.
+	r.advanceCursor(key, staleGen, time.Date(2026, 8, 30, 12, 2, 0, 0, time.UTC))
+	assert.Equal(t, newer, r.cursorFor(key), "only the stream that owns the key may advance it")
 }
 
 func TestIsContainerTerminal_Unknown_ReturnsFalse(t *testing.T) {
@@ -460,7 +648,7 @@ func TestOnPodDeleted_ClearsTerminatedContainerEntries(t *testing.T) {
 	r.onPodAdded(ctx, pod)
 	require.True(t, r.isContainerTerminal(podKey(pod, "app")))
 
-	r.onPodDeleted(pod)
+	r.onPodDeleted(pod, false)
 	assert.False(t, r.isContainerTerminal(podKey(pod, "app")), "terminatedContainers entry must be cleared on delete")
 
 	cancel()
@@ -485,7 +673,7 @@ func TestOnPodAddedDeleted_RecordsActiveStreamsWithRealTelemetry(t *testing.T) {
 	r.mu.Unlock()
 
 	require.NotPanics(t, func() {
-		r.onPodDeleted(makePod("payments", "app-abc", "api", "sidecar"))
+		r.onPodDeleted(makePod("payments", "app-abc", "api", "sidecar"), false)
 	})
 	r.mu.Lock()
 	assert.Empty(t, r.activeStreams)
@@ -622,6 +810,38 @@ func TestStreamStartPoint_ResumeWins(t *testing.T) {
 	assert.Nil(t, sinceSeconds)
 }
 
+// The cursor must advance as batches are delivered, not only when the
+// connection ends. A healthy stream stays open for max_stream_lifetime, so a
+// cursor that only moved on disconnect would sit an hour behind and re-read
+// all of it after an abrupt restart.
+func TestStreamConnection_ReportsProgressPerBatch(t *testing.T) {
+	sink := &consumertest.LogsSink{}
+	r := &logsReceiver{
+		settings: receivertest.NewNopSettings(metadata.Type),
+		consumer: sink,
+		cfg:      &Config{MaxBatchSize: 2, FlushInterval: time.Hour},
+	}
+
+	var input strings.Builder
+	for i := 1; i <= 6; i++ {
+		input.WriteString(fmt.Sprintf("2026-08-30T12:00:0%dZ line-%d\n", i, i))
+	}
+
+	var progress []time.Time
+	lastTS, err := r.streamConnection(context.Background(), strings.NewReader(input.String()),
+		logline.Meta{Namespace: "ns", PodName: "pod", PodUID: "uid", ContainerName: "c"},
+		func(ts time.Time) { progress = append(progress, ts) })
+	require.NoError(t, err)
+
+	require.GreaterOrEqual(t, len(progress), 2,
+		"6 lines at batch size 2 must report progress more than once, got %v", progress)
+	assert.Equal(t, lastTS, progress[len(progress)-1],
+		"the final report must match the returned cursor")
+	for i := 1; i < len(progress); i++ {
+		assert.True(t, progress[i].After(progress[i-1]), "progress must move forward")
+	}
+}
+
 // ---- streamConnection batching ----
 
 func TestStreamConnection_BatchesLinesBySize(t *testing.T) {
@@ -639,7 +859,7 @@ func TestStreamConnection_BatchesLinesBySize(t *testing.T) {
 		b.WriteString("line\n")
 	}
 	_, scanErr := r.streamConnection(context.Background(), strings.NewReader(b.String()),
-		logline.Meta{Namespace: "ns", PodName: "pod", PodUID: "uid", ContainerName: "c"})
+		logline.Meta{Namespace: "ns", PodName: "pod", PodUID: "uid", ContainerName: "c"}, nil)
 
 	require.NoError(t, scanErr)
 	assert.Equal(t, 2, len(sink.AllLogs()), "6 lines / batch 3 should produce 2 batches")
@@ -669,7 +889,7 @@ func TestStreamConnection_FlushesPartialBatchByInterval(t *testing.T) {
 	}()
 
 	_, scanErr := r.streamConnection(context.Background(), pr,
-		logline.Meta{Namespace: "ns", PodName: "pod", PodUID: "uid", ContainerName: "c"})
+		logline.Meta{Namespace: "ns", PodName: "pod", PodUID: "uid", ContainerName: "c"}, nil)
 
 	require.NoError(t, scanErr)
 	require.GreaterOrEqual(t, len(sink.AllLogs()), 1, "partial batch must be flushed by the interval")
@@ -686,7 +906,7 @@ func TestStreamConnection_AdvancesCursorToLastTimestampOnSuccess(t *testing.T) {
 
 	input := "2024-01-15T10:00:04.900000000Z a\n2024-01-15T10:00:05.800000000Z b\n"
 	lastTS, _ := r.streamConnection(context.Background(), strings.NewReader(input),
-		logline.Meta{Namespace: "ns", PodName: "pod", PodUID: "uid", ContainerName: "c"})
+		logline.Meta{Namespace: "ns", PodName: "pod", PodUID: "uid", ContainerName: "c"}, nil)
 
 	want, err := time.Parse(time.RFC3339Nano, "2024-01-15T10:00:05.800000000Z")
 	require.NoError(t, err)
@@ -707,7 +927,7 @@ func TestStreamConnection_StripsTimestampPrefixFromBody(t *testing.T) {
 
 	input := "2024-01-15T10:00:04.900000000Z hello world\n"
 	_, scanErr := r.streamConnection(context.Background(), strings.NewReader(input),
-		logline.Meta{Namespace: "ns", PodName: "pod", PodUID: "uid", ContainerName: "c"})
+		logline.Meta{Namespace: "ns", PodName: "pod", PodUID: "uid", ContainerName: "c"}, nil)
 
 	require.NoError(t, scanErr)
 	require.Equal(t, 1, sink.LogRecordCount())
@@ -732,7 +952,7 @@ func TestStreamConnection_FailedConsumeDoesNotAdvanceCursor(t *testing.T) {
 
 	input := "2024-01-15T10:00:04.900000000Z a\n2024-01-15T10:00:05.800000000Z b\n"
 	lastTS, _ := r.streamConnection(context.Background(), strings.NewReader(input),
-		logline.Meta{Namespace: "ns", PodName: "pod", PodUID: "uid", ContainerName: "c"})
+		logline.Meta{Namespace: "ns", PodName: "pod", PodUID: "uid", ContainerName: "c"}, nil)
 
 	assert.True(t, lastTS.IsZero(), "cursor must not advance when the consumer rejects the batch")
 }
@@ -765,7 +985,7 @@ func TestStreamConnection_SplitsOversizedLineByDefault(t *testing.T) {
 		"2024-01-15T10:00:05.800000000Z c\n"
 
 	lastTS, scanErr := r.streamConnection(context.Background(), strings.NewReader(input),
-		logline.Meta{Namespace: "ns", PodName: "pod", PodUID: "uid", ContainerName: "c"})
+		logline.Meta{Namespace: "ns", PodName: "pod", PodUID: "uid", ContainerName: "c"}, nil)
 
 	require.NoError(t, scanErr, "oversized line must be handled in-stream, not surfaced as an error that triggers a reconnect")
 
@@ -810,7 +1030,7 @@ func TestStreamConnection_TruncatesOversizedLineWhenConfigured(t *testing.T) {
 		"2024-01-15T10:00:05.800000000Z c\n"
 
 	lastTS, scanErr := r.streamConnection(context.Background(), strings.NewReader(input),
-		logline.Meta{Namespace: "ns", PodName: "pod", PodUID: "uid", ContainerName: "c"})
+		logline.Meta{Namespace: "ns", PodName: "pod", PodUID: "uid", ContainerName: "c"}, nil)
 
 	require.NoError(t, scanErr)
 
@@ -846,7 +1066,7 @@ func TestStreamConnection_CancelStopsAndFlushes(t *testing.T) {
 	// Must return promptly (reader goroutine exits) and not deadlock.
 	done := make(chan struct{})
 	go func() {
-		_, _ = r.streamConnection(ctx, pr, logline.Meta{Namespace: "ns", PodName: "pod", PodUID: "uid", ContainerName: "c"})
+		_, _ = r.streamConnection(ctx, pr, logline.Meta{Namespace: "ns", PodName: "pod", PodUID: "uid", ContainerName: "c"}, nil)
 		close(done)
 	}()
 	select {
@@ -889,7 +1109,7 @@ func TestStreamConnection_ConsumeUnblocksOnContextCancel(t *testing.T) {
 
 	done := make(chan struct{})
 	go func() {
-		_, _ = r.streamConnection(ctx, pr, logline.Meta{Namespace: "ns", PodName: "pod", PodUID: "uid", ContainerName: "c"})
+		_, _ = r.streamConnection(ctx, pr, logline.Meta{Namespace: "ns", PodName: "pod", PodUID: "uid", ContainerName: "c"}, nil)
 		close(done)
 	}()
 
@@ -1003,7 +1223,7 @@ func TestStreamConnection_AbortsOnRefusalSoRecordsCanBeReRead(t *testing.T) {
 
 	lastTS, err := r.streamConnection(context.Background(), stream, logline.Meta{
 		Namespace: "ns", PodName: "pod", ContainerName: "c",
-	})
+	}, nil)
 
 	require.ErrorIs(t, err, errPipelineRefused, "refusal must abort the connection")
 	assert.Equal(t, "2026-08-14T10:00:01Z", lastTS.UTC().Format(time.RFC3339),
@@ -1042,7 +1262,319 @@ func TestStreamConnection_NormalEndIsNotAnAbort(t *testing.T) {
 
 	lastTS, err := r.streamConnection(context.Background(), stream, logline.Meta{
 		Namespace: "ns", PodName: "pod", ContainerName: "c",
-	})
+	}, nil)
 	require.NoError(t, err)
 	assert.Equal(t, "2026-08-14T10:00:01Z", lastTS.UTC().Format(time.RFC3339))
+}
+
+// A stream that ends on its own — a terminal container, an exhausted
+// MaxElapsedTime — gets no pod event to correct the gauge, so releaseStream
+// must record it. Otherwise active_log_streams stays overstated indefinitely,
+// and the metric README recommends for diagnosis is systematically wrong.
+func TestReleaseStream_RecordsActiveStreams(t *testing.T) {
+	tt := componenttest.NewTelemetry()
+	defer func() { require.NoError(t, tt.Shutdown(context.Background())) }()
+
+	tb, err := metadata.NewTelemetryBuilder(tt.NewTelemetrySettings())
+	require.NoError(t, err)
+
+	r := newTestReceiver()
+	r.telemetry = tb
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	r.onPodAdded(ctx, makePod("payments", "app-abc", "api", "sidecar"))
+	assertActiveStreamsGauge(t, tt, 2)
+
+	// Both streams now finish on their own, with no pod event in sight.
+	r.mu.Lock()
+	handles := make(map[string]uint64, len(r.activeStreams))
+	for key, h := range r.activeStreams {
+		handles[key] = h.gen
+	}
+	r.mu.Unlock()
+	require.Len(t, handles, 2)
+
+	want := int64(2)
+	for key, gen := range handles {
+		r.releaseStream(ctx, key, gen)
+		want--
+		assertActiveStreamsGauge(t, tt, want)
+	}
+
+	// A stale release — the key already belongs to a replacement — changes
+	// nothing, so it must not report a count either way.
+	for key, gen := range handles {
+		r.releaseStream(ctx, key, gen)
+	}
+	assertActiveStreamsGauge(t, tt, 0)
+
+	cancel()
+	r.wg.Wait()
+}
+
+// The gauge must also survive the usual case: cleanup runs from a deferred
+// call whose context is already cancelled.
+func TestReleaseStream_RecordsWithCancelledContext(t *testing.T) {
+	tt := componenttest.NewTelemetry()
+	defer func() { require.NoError(t, tt.Shutdown(context.Background())) }()
+
+	tb, err := metadata.NewTelemetryBuilder(tt.NewTelemetrySettings())
+	require.NoError(t, err)
+
+	r := newTestReceiver()
+	r.telemetry = tb
+
+	key := streamKey("ns", "pod", "uid", "c")
+	gen := seedCursor(r, key, time.Time{})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	r.releaseStream(ctx, key, gen)
+
+	assertActiveStreamsGauge(t, tt, 0)
+}
+
+func assertActiveStreamsGauge(t *testing.T, tt *componenttest.Telemetry, want int64) {
+	t.Helper()
+	metadatatest.AssertEqualActiveLogStreams(t, tt,
+		[]metricdata.DataPoint[int64]{{Value: want}},
+		metricdatatest.IgnoreTimestamp())
+}
+
+// A pipeline refusal of the *final* batch is still a refusal. EOF makes the
+// scanner error nil, so returning it here would look like a clean end: a live
+// container would not reconnect and a terminal one would never be drained, and
+// those records would be gone for good.
+func TestStreamConnection_RefusedFinalFlushOnEOFAborts(t *testing.T) {
+	r := newTestReceiver()
+	r.cfg.MaxBatchSize = 100        // no size-triggered flush
+	r.cfg.FlushInterval = time.Hour // no time-triggered flush either
+	r.settings = receivertest.NewNopSettings(metadata.Type)
+	r.consumer = &oneShotRefuser{next: consumertest.NewNop(), refuseOn: 1}
+
+	stream := io.NopCloser(strings.NewReader(
+		"2026-08-14T10:00:01.000000000Z first\n" +
+			"2026-08-14T10:00:02.000000000Z second\n",
+	))
+
+	lastTS, err := r.streamConnection(context.Background(), stream, logline.Meta{
+		Namespace: "ns", PodName: "pod", ContainerName: "c",
+	}, nil)
+
+	require.ErrorIs(t, err, errPipelineRefused,
+		"a refused batch at EOF must not be reported as a clean stream end")
+	assert.True(t, lastTS.IsZero(), "nothing was delivered, so the cursor must not move")
+}
+
+// A container the receiver only ever saw as terminal still has logs nobody has
+// read — a completed init container, a short-lived Job. It must be streamed
+// once, and then never reopened: a resync that keeps reconnecting to a
+// container that will never write again just hammers the API server.
+func TestEnsureStreams_StreamsTerminalContainerOnceThenStopsReopeningIt(t *testing.T) {
+	r := newTestReceiver()
+	pod := makePod("default", "job-abc", "app")
+	pod.Spec.RestartPolicy = corev1.RestartPolicyNever
+	pod.Status.ContainerStatuses = []corev1.ContainerStatus{terminatedStatus("app", 0)}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	r.onPodAdded(ctx, pod)
+	key := podKey(pod, "app")
+	r.mu.Lock()
+	h, streaming := r.activeStreams[key]
+	r.mu.Unlock()
+	require.True(t, streaming, "an already-terminal container still has logs worth reading")
+
+	// The stream drains the container and ends on its own.
+	r.releaseStream(ctx, key, h.gen)
+
+	// The next resync delivers the very same pod.
+	r.ensureStreams(ctx, pod)
+	r.mu.Lock()
+	_, reopened := r.activeStreams[key]
+	r.mu.Unlock()
+	assert.False(t, reopened, "a drained container must not be reopened by a resync")
+
+	cancel()
+	r.wg.Wait()
+}
+
+// The opposite case: a stream that stopped while the container was still alive
+// (an exhausted MaxElapsedTime) is exactly what a resync is meant to revive.
+func TestEnsureStreams_ReopensLiveContainerAfterItsStreamGaveUp(t *testing.T) {
+	r := newTestReceiver()
+	pod := makePod("default", "app-abc", "app")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	r.onPodAdded(ctx, pod)
+	key := podKey(pod, "app")
+	r.mu.Lock()
+	h := r.activeStreams[key]
+	r.mu.Unlock()
+
+	r.releaseStream(ctx, key, h.gen)
+
+	r.ensureStreams(ctx, pod)
+	r.mu.Lock()
+	_, reopened := r.activeStreams[key]
+	r.mu.Unlock()
+	assert.True(t, reopened, "a resync must restart a stream that gave up on a live container")
+
+	cancel()
+	r.wg.Wait()
+}
+
+// component.Component documents the Start context as covering the startup
+// operation only — it lives for the whole collector today, but is explicitly
+// allowed to gain a startup timeout. Everything the receiver runs in the
+// background must therefore be rooted in its own context, and stop on
+// Shutdown and nothing else.
+func TestStart_BackgroundWorkOutlivesTheStartContext(t *testing.T) {
+	// auth_type=none builds the API host from these; nothing has to answer on
+	// it, the informers just keep retrying in the background.
+	t.Setenv("KUBERNETES_SERVICE_HOST", "127.0.0.1")
+	t.Setenv("KUBERNETES_SERVICE_PORT", "1")
+
+	f := NewFactory()
+	cfg := f.CreateDefaultConfig().(*Config)
+	cfg.APIConfig.AuthType = AuthTypeNone
+
+	created, err := f.CreateLogs(context.Background(), receivertest.NewNopSettings(f.Type()), cfg, consumertest.NewNop())
+	require.NoError(t, err)
+	r := created.(*logsReceiver)
+
+	startCtx, cancelStart := context.WithCancel(context.Background())
+	require.NoError(t, r.Start(startCtx, componenttest.NewNopHost()))
+
+	// A startup timeout firing must be a non-event.
+	cancelStart()
+
+	stopped := make(chan struct{})
+	go func() {
+		defer close(stopped)
+		r.wg.Wait()
+	}()
+
+	select {
+	case <-stopped:
+		t.Fatal("cancelling the Start context tore down the receiver's background work")
+	case <-time.After(250 * time.Millisecond):
+	}
+
+	require.NoError(t, r.Shutdown(context.Background()))
+	select {
+	case <-stopped:
+	case <-time.After(10 * time.Second):
+		t.Fatal("Shutdown must stop the background work")
+	}
+}
+
+// permanentRefuser rejects the first refuseFirst batches with a permanent
+// error — the pipeline saying "this data is unacceptable", not "I am busy" —
+// and accepts the rest.
+type permanentRefuser struct {
+	mu          sync.Mutex
+	refuseFirst int
+	calls       int
+	accepted    []string
+}
+
+func (c *permanentRefuser) Capabilities() consumer.Capabilities {
+	return consumer.Capabilities{MutatesData: false}
+}
+
+func (c *permanentRefuser) ConsumeLogs(_ context.Context, ld plog.Logs) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.calls++
+	if c.calls <= c.refuseFirst {
+		return consumererror.NewPermanent(errTestPermanent)
+	}
+	records := ld.ResourceLogs().At(0).ScopeLogs().At(0).LogRecords()
+	for i := 0; i < records.Len(); i++ {
+		c.accepted = append(c.accepted, records.At(i).Body().Str())
+	}
+	return nil
+}
+
+var errTestPermanent = errors.New("log record is malformed and will never be accepted")
+
+// A permanent refusal must drop the batch and move the cursor past it. Treating
+// it as a plain refusal reconnects and re-reads the very same records, earns
+// the very same error, and — because a successful connect resets the backoff —
+// spins at about one request per second per container without ever making
+// progress.
+func TestStreamConnection_PermanentRefusalDropsBatchAndMovesOn(t *testing.T) {
+	r := newTestReceiver()
+	r.cfg.MaxBatchSize = 1
+	r.cfg.FlushInterval = time.Hour // only size-triggered flushes
+	r.settings = receivertest.NewNopSettings(metadata.Type)
+
+	c := &permanentRefuser{refuseFirst: 1} // the first line can never be accepted
+	r.consumer = c
+
+	stream := io.NopCloser(strings.NewReader(
+		"2026-08-14T10:00:01.000000000Z poison\n" +
+			"2026-08-14T10:00:02.000000000Z second\n" +
+			"2026-08-14T10:00:03.000000000Z third\n",
+	))
+
+	lastTS, err := r.streamConnection(context.Background(), stream, logline.Meta{
+		Namespace: "ns", PodName: "pod", ContainerName: "c",
+	}, nil)
+
+	require.NoError(t, err, "a permanent refusal must not abort the connection into a re-read loop")
+	assert.Equal(t, []string{"second", "third"}, c.accepted,
+		"reading must continue past the dropped batch")
+	assert.Equal(t, "2026-08-14T10:00:03Z", lastTS.UTC().Format(time.RFC3339),
+		"the cursor must end up past the dropped records")
+}
+
+// The same when nothing is acceptable: the connection still ends cleanly, with
+// the cursor past every dropped record, so a reconnect starts after them
+// instead of re-reading them forever.
+func TestStreamConnection_PermanentRefusalOfEveryBatchStillAdvances(t *testing.T) {
+	r := newTestReceiver()
+	r.cfg.MaxBatchSize = 1
+	r.cfg.FlushInterval = time.Hour
+	r.settings = receivertest.NewNopSettings(metadata.Type)
+	r.consumer = &permanentRefuser{refuseFirst: 100}
+
+	stream := io.NopCloser(strings.NewReader(
+		"2026-08-14T10:00:01.000000000Z one\n" +
+			"2026-08-14T10:00:02.000000000Z two\n",
+	))
+
+	lastTS, err := r.streamConnection(context.Background(), stream, logline.Meta{
+		Namespace: "ns", PodName: "pod", ContainerName: "c",
+	}, nil)
+
+	require.NoError(t, err)
+	assert.Equal(t, "2026-08-14T10:00:02Z", lastTS.UTC().Format(time.RFC3339))
+}
+
+// A permanent refusal reported through the cursor callback must be published
+// too: the drop is progress, and a restart that resumed before it would just
+// re-read the poison.
+func TestStreamConnection_PermanentRefusalPublishesProgress(t *testing.T) {
+	r := newTestReceiver()
+	r.cfg.MaxBatchSize = 1
+	r.cfg.FlushInterval = time.Hour
+	r.settings = receivertest.NewNopSettings(metadata.Type)
+	r.consumer = &permanentRefuser{refuseFirst: 1}
+
+	var progress []time.Time
+	stream := io.NopCloser(strings.NewReader("2026-08-14T10:00:01.000000000Z poison\n"))
+	_, err := r.streamConnection(context.Background(), stream, logline.Meta{
+		Namespace: "ns", PodName: "pod", ContainerName: "c",
+	}, func(ts time.Time) { progress = append(progress, ts) })
+
+	require.NoError(t, err)
+	require.Len(t, progress, 1, "the drop must be published as progress")
+	assert.Equal(t, "2026-08-14T10:00:01Z", progress[0].UTC().Format(time.RFC3339))
 }

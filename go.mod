@@ -26,6 +26,7 @@ require (
 	go.opentelemetry.io/collector/component/componenttest v0.159.0
 	go.opentelemetry.io/collector/confmap v1.65.0
 	go.opentelemetry.io/collector/consumer/consumertest v0.159.0
+	go.opentelemetry.io/collector/extension/xextension v0.159.0
 	go.opentelemetry.io/collector/receiver/receiverhelper v0.159.0
 	go.opentelemetry.io/collector/receiver/receivertest v0.159.0
 	go.opentelemetry.io/otel v1.45.0
@@ -34,6 +35,8 @@ require (
 	go.opentelemetry.io/otel/trace v1.45.0
 	go.uber.org/goleak v1.3.0
 )
+
+require go.opentelemetry.io/collector/extension v1.65.0 // indirect
 
 require (
 	github.com/cenkalti/backoff/v4 v4.3.0

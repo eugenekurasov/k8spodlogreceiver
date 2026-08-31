@@ -8,6 +8,7 @@ import (
 
 	"go.opentelemetry.io/collector/pdata/pcommon"
 	"go.opentelemetry.io/collector/pdata/plog"
+	semconv "go.opentelemetry.io/otel/semconv/v1.43.0"
 
 	"github.com/eugenekurasov/k8spodlogreceiver/internal/metadata"
 )
@@ -17,6 +18,8 @@ type Meta struct {
 	PodName       string
 	PodUID        string
 	ContainerName string
+	NodeName      string
+	RestartCount  int32
 }
 
 type Batch struct {
@@ -29,11 +32,18 @@ func NewBatch(m Meta) *Batch {
 	logs := plog.NewLogs()
 	rl := logs.ResourceLogs().AppendEmpty()
 
-	res := rl.Resource()
-	res.Attributes().PutStr("k8s.namespace.name", m.Namespace)
-	res.Attributes().PutStr("k8s.pod.name", m.PodName)
-	res.Attributes().PutStr("k8s.pod.uid", m.PodUID)
-	res.Attributes().PutStr("k8s.container.name", m.ContainerName)
+	// Attribute names come from the semantic conventions rather than string
+	// literals, so a typo cannot ship and the version they follow is a single
+	// import to bump. rl.SchemaUrl states that version to whatever reads these
+	// records — that is what makes a schema processor able to translate them.
+	rl.SetSchemaUrl(semconv.SchemaURL)
+	attrs := rl.Resource().Attributes()
+	attrs.PutStr(string(semconv.K8SNamespaceNameKey), m.Namespace)
+	attrs.PutStr(string(semconv.K8SPodNameKey), m.PodName)
+	attrs.PutStr(string(semconv.K8SPodUIDKey), m.PodUID)
+	attrs.PutStr(string(semconv.K8SContainerNameKey), m.ContainerName)
+	attrs.PutStr(string(semconv.K8SNodeNameKey), m.NodeName)
+	attrs.PutInt(string(semconv.K8SContainerRestartCountKey), int64(m.RestartCount))
 
 	sl := rl.ScopeLogs().AppendEmpty()
 	sl.Scope().SetName(metadata.ScopeName)

@@ -53,13 +53,35 @@ type Config struct {
 	// retained.
 	SinceSeconds *int64 `mapstructure:"since_seconds"`
 
+	// StorageID names a storage extension used to persist read cursors, so a
+	// restarted collector resumes each container where it stopped instead of
+	// re-reading SinceSeconds. Without it cursors live only in memory and are
+	// lost on restart.
+	StorageID *component.ID `mapstructure:"storage"`
+
+	// MaxStreamLifetime caps how long a single log connection is followed
+	// before it is deliberately closed and reopened from the last delivered
+	// line. It guards against a connection that stays open but stops
+	// delivering: the socket remains healthy, so nothing errors and
+	// ReconnectBackoff never triggers, and the stream goes silently mute.
+	// Recycling on a schedule bounds how long that can go unnoticed.
+	//
+	// 0 disables the cap. Default defaultMaxStreamLifetime.
+	MaxStreamLifetime time.Duration `mapstructure:"max_stream_lifetime"`
+
 	// PodResyncPeriod is how often the pod informer re-delivers every pod it
 	// has cached as an update. That re-runs the receiver's (idempotent)
-	// stream bookkeeping, so it doubles as a self-healing sweep: a container
-	// stream that gave up — say after ReconnectBackoff.MaxElapsedTime — is
-	// started again on the next resync instead of waiting for that pod to
-	// change. Resyncs are served from the local cache and cost no API server
-	// traffic. Three states, via the pointer:
+	// stream bookkeeping, so it doubles as a self-healing sweep: any stream
+	// that is missing for its container is started again on the next resync
+	// instead of waiting for that pod to change. Resyncs are served from the
+	// local cache and cost no API server traffic.
+	//
+	// Note the interaction with ReconnectBackoff.MaxElapsedTime: a stream
+	// that gives up is only revived by this sweep, so a finite MaxElapsedTime
+	// shorter than this period leaves that container uncollected for the
+	// remainder of the interval. The default MaxElapsedTime is 0 precisely so
+	// recovery does not depend on the sweep; if you set a finite one, keep it
+	// longer than this period. Three states, via the pointer:
 	//   - nil (key absent from config): defaultPodResyncPeriod.
 	//   - pointer to 0: no resync; streams start only on real pod events.
 	//   - pointer to N > 0: resync every N.
@@ -123,6 +145,11 @@ const (
 	// stream which gave up is not left dead for long.
 	defaultPodResyncPeriod = 10 * time.Minute
 
+	// defaultMaxStreamLifetime is how long one connection is followed before
+	// being recycled. An hour is long enough that the reconnect cost is
+	// negligible, short enough to bound an undetected mute stream.
+	defaultMaxStreamLifetime = 1 * time.Hour
+
 	// defaultSinceSeconds bounds the backfill read when a container is first
 	// discovered. A bound is the default rather than unlimited history: on
 	// restart the receiver rediscovers every container at once, and an
@@ -185,6 +212,9 @@ var (
 func (cfg *Config) Validate() error {
 	if cfg.SinceSeconds != nil && *cfg.SinceSeconds < 0 {
 		return errors.New("k8spodlogreceiver: since_seconds must be >= 0")
+	}
+	if cfg.MaxStreamLifetime < 0 {
+		return errors.New("k8spodlogreceiver: max_stream_lifetime must be >= 0")
 	}
 	if cfg.PodResyncPeriod != nil && *cfg.PodResyncPeriod < 0 {
 		return errors.New("k8spodlogreceiver: pod_resync_period must be >= 0")

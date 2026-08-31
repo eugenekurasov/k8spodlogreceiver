@@ -83,7 +83,7 @@ tag:
 
 ```yaml
 receivers:
-  - gomod: github.com/eugenekurasov/k8spodlogreceiver v0.1.0
+  - gomod: github.com/eugenekurasov/k8spodlogreceiver v0.1.1
 ```
 
 Keep the collector component versions in your builder config aligned with the

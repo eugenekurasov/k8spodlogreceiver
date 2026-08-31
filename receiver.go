@@ -578,13 +578,13 @@ func (r *logsReceiver) newContainerStream(namespace, podName, podUID, containerN
 			PodUID:        podUID,
 			ContainerName: containerName,
 			NodeName:      nodeName,
-			RestartCount:  r.getRestartCount(key),
 		},
 		logger: r.settings.Logger.With(
 			zap.String("namespace", namespace),
 			zap.String("pod", podName),
 			zap.String("container", containerName),
 			zap.String("podUID", podUID),
+			zap.String("node", nodeName),
 		),
 		resumeFrom:        r.cursorFor(key),
 		onDelivered:       func(ts time.Time) { r.advanceCursor(key, gen, ts) },
@@ -593,6 +593,7 @@ func (r *logsReceiver) newContainerStream(namespace, podName, podUID, containerN
 		maxStreamLifetime: r.cfg.MaxStreamLifetime,
 		consume:           r.streamConnection,
 		isTerminal:        func() bool { return r.isContainerTerminal(key) },
+		restartCount:      func() int32 { return r.getRestartCount(key) },
 		backoff:           r.cfg.ReconnectBackoff.InitialInterval,
 		firstAttempt:      true,
 	}

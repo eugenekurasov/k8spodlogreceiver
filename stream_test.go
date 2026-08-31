@@ -28,6 +28,7 @@ func lifetimeStream(t *testing.T, lifetime time.Duration, consume func(context.C
 		maxStreamLifetime: lifetime,
 		consume:           consume,
 		isTerminal:        func() bool { return false },
+		restartCount:      func() int32 { return 0 },
 		backoff:           time.Millisecond,
 		firstAttempt:      true,
 	}
@@ -166,4 +167,40 @@ func TestConnectionContext_JittersTheLifetimeCap(t *testing.T) {
 		deadlines[remaining.Round(time.Millisecond)] = struct{}{}
 	}
 	assert.Greater(t, len(deadlines), 1, "identical caps would recycle in lockstep")
+}
+
+// A container restart is what ends a follow stream, so the count the receiver
+// holds has moved on by the time the stream reconnects. Capturing it once at
+// construction stamped every later record with the count the container had at
+// birth — usually 0, which is to say the attribute never reported a restart.
+func TestRun_RestartCountIsRereadOnEachConnection(t *testing.T) {
+	var mu sync.Mutex
+	var restarts int32
+	var seen []int32
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	s := lifetimeStream(t, 0, func(_ context.Context, _ io.Reader, m logline.Meta, _ func(time.Time)) (time.Time, error) {
+		mu.Lock()
+		seen = append(seen, m.RestartCount)
+		restarts++ // the container restarts between every connection
+		done := len(seen) == 3
+		mu.Unlock()
+		if done {
+			cancel()
+		}
+		return time.Time{}, io.EOF // stream ended: reconnect
+	})
+	s.restartCount = func() int32 {
+		mu.Lock()
+		defer mu.Unlock()
+		return restarts
+	}
+
+	s.run(ctx)
+
+	mu.Lock()
+	defer mu.Unlock()
+	assert.Equal(t, []int32{0, 1, 2}, seen)
 }

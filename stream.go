@@ -52,6 +52,13 @@ type containerStream struct {
 	consume func(ctx context.Context, stream io.Reader, m logline.Meta, onProgress func(time.Time)) (time.Time, error)
 	// isTerminal reports whether this container has been marked terminated.
 	isTerminal func() bool
+	// restartCount reports the container's current restart count. It is read
+	// again before every connection rather than captured once: a restart is
+	// exactly what ends a follow stream, so the count the receiver holds has
+	// usually changed by the time the next connection opens, and a snapshot
+	// taken when the stream started would label every later line with the
+	// count the container had at birth.
+	restartCount func() int32
 	// onDelivered publishes the cursor so it outlives this stream: a
 	// replacement started after a watch break resumes from it.
 	onDelivered func(time.Time)
@@ -75,6 +82,7 @@ func (s *containerStream) run(ctx context.Context) {
 			return
 		}
 		s.countReconnect(ctx)
+		s.meta.RestartCount = s.restartCount()
 
 		// connCtx bounds this one connection. ctx still bounds the stream as a
 		// whole, so an expired connCtx means "recycle", not "stop".

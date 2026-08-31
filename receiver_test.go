@@ -824,7 +824,7 @@ func TestStreamConnection_ReportsProgressPerBatch(t *testing.T) {
 
 	var input strings.Builder
 	for i := 1; i <= 6; i++ {
-		input.WriteString(fmt.Sprintf("2026-08-30T12:00:0%dZ line-%d\n", i, i))
+		fmt.Fprintf(&input, "2026-08-30T12:00:0%dZ line-%d\n", i, i)
 	}
 
 	var progress []time.Time

@@ -5,7 +5,7 @@
 // through the Kubernetes API server (the same path `kubectl logs -f` uses),
 // instead of requiring a DaemonSet with a read-only host-root mount.
 //
-// Motivation
+// # Motivation
 //
 // The existing proposal for a k8slog receiver
 // (open-telemetry/opentelemetry-collector-contrib#23339) collects logs by

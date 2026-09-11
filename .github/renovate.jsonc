@@ -25,6 +25,11 @@
     },
     {
       "matchDepNames": ["kindest/node"],
+      "separateMinorPatch": true
+    },
+    {
+      // Which Kubernetes minors the matrix covers is a maintainer decision.
+      "matchDepNames": ["kindest/node"],
       "matchUpdateTypes": ["major", "minor"],
       "enabled": false
     },

@@ -13,59 +13,22 @@
 
   "packageRules": [
     {
-      "groupName": "go modules",
-      "matchManagers": ["gomod"]
-    },
-    {
-      "groupName": "opentelemetry-collector",
-      "matchPackageNames": [
-        "go.opentelemetry.io/collector{/,}**",
-        "github.com/open-telemetry/opentelemetry-collector-contrib{/,}**"
-      ]
-    },
-    {
-      // A separate release train from the Collector, despite the shared prefix.
-      "groupName": "opentelemetry-go",
-      "matchPackageNames": [
-        "go.opentelemetry.io/otel{/,}**",
-        "go.opentelemetry.io/auto{/,}**"
-      ]
-    },
-    {
-      // api, apimachinery and client-go are released in lockstep.
-      "groupName": "kubernetes",
-      "matchPackageNames": ["k8s.io/**", "sigs.k8s.io/**"]
-    },
-    {
-      "groupName": "github actions",
-      "matchManagers": ["github-actions"]
-    },
-    {
-      "groupName": "kind node images",
-      "matchDepNames": ["kindest/node"]
-    },
-    {
-      // The integration matrix deliberately pins three Kubernetes minors;
-      // which minors are tested is a maintainer decision, so Renovate only
-      // refreshes the patch tag within each.
-      "matchDepNames": ["kindest/node"],
-      "matchUpdateTypes": ["major", "minor"],
-      "enabled": false
+      "groupName": "all dependencies",
+      "matchPackageNames": ["**"]
     },
     {
       "matchPackageNames": [
         "k8s.io/api",
         "k8s.io/apimachinery",
         "k8s.io/client-go"
-      ],
+      ]
+    },
+    {
+      "matchDepNames": ["kindest/node"],
       "matchUpdateTypes": ["major", "minor"],
       "enabled": false
     },
     {
-      // internal/consumerretry is a verbatim copy of contrib's package,
-      // which imports backoff/v4. A new major rewrites the import path and
-      // diverges from upstream, making future refreshes harder to diff, so
-      // this stays on the v4 line and takes v4.x updates only.
       "matchPackageNames": ["github.com/cenkalti/backoff/v4"],
       "matchUpdateTypes": ["major"],
       "enabled": false

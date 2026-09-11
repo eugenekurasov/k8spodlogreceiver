@@ -25,7 +25,11 @@
     },
     {
       "matchDepNames": ["kindest/node"],
-      "separateMinorPatch": true
+      "separateMinorPatch": true,
+      // These already land on their own branch because of the setting above,
+      // so naming the group costs no extra pull request and stops the title
+      // claiming the PR touches every dependency.
+      "groupName": "kind node images"
     },
     {
       // Which Kubernetes minors the matrix covers is a maintainer decision.

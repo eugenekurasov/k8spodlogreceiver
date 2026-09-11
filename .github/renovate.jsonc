@@ -13,6 +13,10 @@
 
   "packageRules": [
     {
+      "groupName": "go modules",
+      "matchManagers": ["gomod"]
+    },
+    {
       "groupName": "opentelemetry-collector",
       "matchPackageNames": [
         "go.opentelemetry.io/collector{/,}**",
@@ -47,6 +51,24 @@
       "matchDepNames": ["kindest/node"],
       "matchUpdateTypes": ["major", "minor"],
       "enabled": false
+    },
+    {
+      "matchPackageNames": [
+        "k8s.io/api",
+        "k8s.io/apimachinery",
+        "k8s.io/client-go"
+      ],
+      "matchUpdateTypes": ["major", "minor"],
+      "enabled": false
+    },
+    {
+      // internal/consumerretry is a verbatim copy of contrib's package,
+      // which imports backoff/v4. A new major rewrites the import path and
+      // diverges from upstream, making future refreshes harder to diff, so
+      // this stays on the v4 line and takes v4.x updates only.
+      "matchPackageNames": ["github.com/cenkalti/backoff/v4"],
+      "matchUpdateTypes": ["major"],
+      "enabled": false
     }
   ],
 
@@ -78,7 +100,7 @@
       "description": "Collector stable (v1.x) version quoted in the README status table and build notes",
       "managerFilePatterns": ["README.md"],
       "matchStrings": [
-        "`?(?<currentValue>v1\\.\\d+\\.\\d+)`? / `?v0\\.\\d+\\.\\d+"
+        "(?:pinned to|core) `?(?<currentValue>v1\\.\\d+\\.\\d+)"
       ],
       "depNameTemplate": "go.opentelemetry.io/collector/pdata",
       "datasourceTemplate": "go"
@@ -88,7 +110,7 @@
       "description": "Collector unstable (v0.x) version quoted in the README status table and build notes",
       "managerFilePatterns": ["README.md"],
       "matchStrings": [
-        "v1\\.\\d+\\.\\d+`? / `?(?<currentValue>v0\\.\\d+\\.\\d+)"
+        "/ `?(?<currentValue>v0\\.\\d+\\.\\d+)"
       ],
       "depNameTemplate": "go.opentelemetry.io/collector/service",
       "datasourceTemplate": "go"

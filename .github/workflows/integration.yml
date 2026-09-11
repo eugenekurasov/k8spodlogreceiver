@@ -20,11 +20,11 @@ jobs:
           - k8s-version: "1.37"
             kind-image: "kindest/node:v1.37.0"
           - k8s-version: "1.36"
-            kind-image: "kindest/node:v1.36.1"
+            kind-image: "kindest/node:v1.36.4"
           - k8s-version: "1.35"
-            kind-image: "kindest/node:v1.35.5"
+            kind-image: "kindest/node:v1.35.8"
           - k8s-version: "1.34"
-            kind-image: "kindest/node:v1.34.8"
+            kind-image: "kindest/node:v1.34.11"
 
     steps:
       - uses: actions/checkout@v7.0.1

@@ -1,0 +1,106 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": [
+    "config:recommended",
+    ":dependencyDashboard",
+    ":semanticCommits"
+  ],
+  "labels": ["dependencies"],
+  "ignorePaths": ["build/**"],
+  "minimumReleaseAge": "3 days",
+  "prHourlyLimit": 0,
+  "postUpdateOptions": ["gomodTidy", "gomodUpdateImportPaths"],
+
+  "packageRules": [
+    {
+      "groupName": "opentelemetry-collector",
+      "matchPackageNames": [
+        "go.opentelemetry.io/collector{/,}**",
+        "github.com/open-telemetry/opentelemetry-collector-contrib{/,}**"
+      ]
+    },
+    {
+      // A separate release train from the Collector, despite the shared prefix.
+      "groupName": "opentelemetry-go",
+      "matchPackageNames": [
+        "go.opentelemetry.io/otel{/,}**",
+        "go.opentelemetry.io/auto{/,}**"
+      ]
+    },
+    {
+      // api, apimachinery and client-go are released in lockstep.
+      "groupName": "kubernetes",
+      "matchPackageNames": ["k8s.io/**", "sigs.k8s.io/**"]
+    },
+    {
+      "groupName": "github actions",
+      "matchManagers": ["github-actions"]
+    },
+    {
+      "groupName": "kind node images",
+      "matchDepNames": ["kindest/node"]
+    },
+    {
+      // The integration matrix deliberately pins three Kubernetes minors;
+      // which minors are tested is a maintainer decision, so Renovate only
+      // refreshes the patch tag within each.
+      "matchDepNames": ["kindest/node"],
+      "matchUpdateTypes": ["major", "minor"],
+      "enabled": false
+    }
+  ],
+
+  "customManagers": [
+    {
+      "customType": "regex",
+      "description": "Module pins in the ocb builder manifest",
+      "managerFilePatterns": ["builder-config.yaml"],
+      "matchStrings": [
+        "gomod:\\s+(?<depName>(?:go\\.opentelemetry\\.io|github\\.com/open-telemetry)/\\S+)\\s+(?<currentValue>v\\S+)"
+      ],
+      "datasourceTemplate": "go"
+    },
+    {
+      "customType": "regex",
+      "description": "ocb version, pinned in CI and repeated in the builder-config header and README",
+      "managerFilePatterns": [
+        "builder-config.yaml",
+        ".github/workflows/ci.yml",
+        "README.md"
+      ],
+      "matchStrings": [
+        "go install (?<depName>go\\.opentelemetry\\.io/collector/cmd/builder)@(?<currentValue>v\\S+)"
+      ],
+      "datasourceTemplate": "go"
+    },
+    {
+      "customType": "regex",
+      "description": "Collector stable (v1.x) version quoted in the README status table and build notes",
+      "managerFilePatterns": ["README.md"],
+      "matchStrings": [
+        "`?(?<currentValue>v1\\.\\d+\\.\\d+)`? / `?v0\\.\\d+\\.\\d+"
+      ],
+      "depNameTemplate": "go.opentelemetry.io/collector/pdata",
+      "datasourceTemplate": "go"
+    },
+    {
+      "customType": "regex",
+      "description": "Collector unstable (v0.x) version quoted in the README status table and build notes",
+      "managerFilePatterns": ["README.md"],
+      "matchStrings": [
+        "v1\\.\\d+\\.\\d+`? / `?(?<currentValue>v0\\.\\d+\\.\\d+)"
+      ],
+      "depNameTemplate": "go.opentelemetry.io/collector/service",
+      "datasourceTemplate": "go"
+    },
+    {
+      "customType": "regex",
+      "description": "kind node images in the integration matrix",
+      "managerFilePatterns": [".github/workflows/integration.yml"],
+      "matchStrings": [
+        "kind-image:\\s+\"(?<depName>kindest/node):(?<currentValue>v[^\"]+)\""
+      ],
+      "datasourceTemplate": "docker"
+    }
+  ]
+}

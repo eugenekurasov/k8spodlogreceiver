@@ -72,6 +72,24 @@ The files under `internal/metadata`, `internal/metadatatest`, and the
 `generated_*.go` files are produced by `mdatagen` from
 [`metadata.yaml`](metadata.yaml); regenerate them rather than editing them.
 
+## Dependency updates
+
+[Renovate](https://docs.renovatebot.com/) runs from
+[`.github/workflows/renovate.yml`](.github/workflows/renovate.yml) on a
+weekday schedule, configured by
+[`.github/renovate.jsonc`](.github/renovate.jsonc).
+
+Anything released in lockstep is grouped into one pull request, so an
+update to the Collector touches `go.mod`,
+[`builder-config.yaml`](builder-config.yaml),
+[`ci.yml`](.github/workflows/ci.yml) and the versions quoted in the README
+together. That is deliberate — a partial bump does not build.
+
+Renovate authenticates as a GitHub App, which must be installed on the
+repository and needs a `RENOVATE_APP_CLIENT_ID` variable plus a secret
+holding the App's `.pem` private key — not its OAuth client secret, which
+will not work.
+
 ## Third-party code
 
 Two packages are derived from `opentelemetry-collector-contrib` (Copyright

@@ -14,16 +14,16 @@ jobs:
     name: Lint
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v7.0.1
 
       - name: Cache vendor
         id: cache-vendor
-        uses: actions/cache@v6
+        uses: actions/cache@v6.1.0
         with:
           path: vendor
           key: ${{ runner.os }}-go-vendor-${{ hashFiles('go.sum') }}
 
-      - uses: actions/setup-go@v6
+      - uses: actions/setup-go@v7.0.0
         with:
           go-version-file: go.mod
 
@@ -33,9 +33,9 @@ jobs:
     name: License headers
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v7.0.1
 
-      - uses: actions/setup-go@v6
+      - uses: actions/setup-go@v7.0.0
         with:
           go-version-file: go.mod
 

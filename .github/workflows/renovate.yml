@@ -1,0 +1,52 @@
+name: Renovate
+
+on:
+  schedule:
+    # Twice on weekdays, outside working hours (UTC), so PRs are waiting
+    # rather than landing mid-review.
+    - cron: "0 5 * * 1-5"
+    - cron: "0 17 * * 1-5"
+  workflow_dispatch:
+    inputs:
+      logLevel:
+        description: Log level
+        type: choice
+        default: info
+        options: [info, debug]
+      dryRun:
+        description: Dry run — report what would happen, open no PRs
+        type: boolean
+        default: false
+
+# Never let a scheduled run overlap a manual one: two Renovate processes on
+# the same repo fight over the same branches.
+concurrency:
+  group: renovate
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  renovate:
+    name: Renovate
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: actions/create-github-app-token@v3.2.0
+        id: app-token
+        with:
+          client-id: ${{ vars.RENOVATE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.RENOVATE_APP_CLIENT_SECRET }}
+      - uses: renovatebot/github-action@v46.2.6
+        with:
+          token: ${{ steps.app-token.outputs.token  }}
+        env:
+          LOG_LEVEL: ${{ inputs.logLevel || 'info' }}
+          # Empty on scheduled runs, which Renovate ignores; "true" from the
+          # manual dispatch is mapped to a full dry run.
+          RENOVATE_DRY_RUN: ${{ inputs.dryRun }}
+          RENOVATE_PLATFORM: github
+          RENOVATE_REPOSITORIES: ${{ github.repository }}
+          RENOVATE_ONBOARDING: "false"
+          RENOVATE_REQUIRE_CONFIG: optional

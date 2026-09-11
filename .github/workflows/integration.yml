@@ -25,16 +25,16 @@ jobs:
             kind-image: "kindest/node:v1.34.8"
 
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v7.0.1
 
-      - uses: actions/setup-go@v6
+      - uses: actions/setup-go@v7.0.0
         with:
           go-version-file: go.mod
           cache-dependency-path: go.sum
 
       - name: Cache vendor
         id: cache-vendor
-        uses: actions/cache@v6
+        uses: actions/cache@v6.1.0
         with:
           path: vendor
           key: ${{ runner.os }}-go-vendor-${{ hashFiles('go.sum') }}
@@ -44,7 +44,7 @@ jobs:
         run: go mod vendor
 
       - name: Create kind cluster (k8s ${{ matrix.k8s-version }})
-        uses: helm/kind-action@v1
+        uses: helm/kind-action@v1.15.0
         with:
           node_image: ${{ matrix.kind-image }}
           cluster_name: k8spodlog-test

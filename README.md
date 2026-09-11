@@ -11,7 +11,7 @@ node-level access.
 |---|---|
 | Stability | [development](https://github.com/open-telemetry/opentelemetry-collector/blob/main/docs/component-stability.md#development): logs |
 | Supported signals | logs |
-| Collector core | pinned to v1.65.0 / v0.159.0 |
+| Collector core | pinned to v1.66.0 / v0.159.0 |
 
 ## Kubernetes version compatibility
 
@@ -72,7 +72,7 @@ that includes it, with the
 [OpenTelemetry Collector Builder](https://opentelemetry.io/docs/collector/extend/ocb/):
 
 ```bash
-go install go.opentelemetry.io/collector/cmd/builder@v0.159.0
+go install go.opentelemetry.io/collector/cmd/builder@v0.160.0
 builder --config builder-config.yaml
 ```
 
@@ -87,7 +87,7 @@ receivers:
 ```
 
 Keep the collector component versions in your builder config aligned with the
-ones this module pins (core `v1.65.0` / `v0.159.0`) — a mismatch surfaces as
+ones this module pins (core `v1.66.0` / `v0.159.0`) — a mismatch surfaces as
 confusing build errors rather than a clear version conflict.
 
 ### Configuration

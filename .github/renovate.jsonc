@@ -14,7 +14,7 @@
   "packageRules": [
     {
       "groupName": "all dependencies",
-      "matchPackageNames": ["**"]
+      "matchDatasources": ["go"]
     },
     {
       "matchPackageNames": [

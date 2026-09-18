@@ -13,6 +13,10 @@ node-level access.
 | Supported signals | logs |
 | Collector core | pinned to v1.67.0 / v0.161.0 |
 
+Stability stays at `development` until a benchmark suite reports throughput,
+memory, and API server load under a realistic pod count. Promotion to
+[`alpha`](https://github.com/open-telemetry/opentelemetry-collector/blob/main/docs/component-stability.md#alpha) follows those numbers, not a date.
+
 ## Kubernetes version compatibility
 
 [![K8s compatibility tests](https://github.com/eugenekurasov/k8spodlogreceiver/actions/workflows/integration.yml/badge.svg?branch=main)](https://github.com/eugenekurasov/k8spodlogreceiver/actions/workflows/integration.yml)

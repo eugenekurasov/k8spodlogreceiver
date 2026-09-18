@@ -37,7 +37,7 @@ jobs:
         id: app-token
         with:
           client-id: ${{ vars.RENOVATE_APP_CLIENT_ID }}
-          private-key: ${{ secrets.RENOVATE_APP_CLIENT_SECRET }}
+          private-key: ${{ secrets.RENOVATE_APP_PRIVATE_KEY }}
       - uses: renovatebot/github-action@v46.3.1
         with:
           token: ${{ steps.app-token.outputs.token  }}

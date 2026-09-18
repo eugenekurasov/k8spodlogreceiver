@@ -81,10 +81,14 @@ collector from the working tree (`path: ./`) and is what CI builds on every
 change. To use a released version instead, drop the `path` line and pin the
 tag:
 
+<!-- x-release-please-start-version -->
+
 ```yaml
 receivers:
-  - gomod: github.com/eugenekurasov/k8spodlogreceiver v0.1.1
+  - gomod: github.com/eugenekurasov/k8spodlogreceiver v0.1.2
 ```
+
+<!-- x-release-please-end -->
 
 Keep the collector component versions in your builder config aligned with the
 ones this module pins (core `v1.67.0` / `v0.161.0`) — a mismatch surfaces as

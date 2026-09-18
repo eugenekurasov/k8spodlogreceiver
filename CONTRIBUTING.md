@@ -90,6 +90,16 @@ repository and needs a `RENOVATE_APP_CLIENT_ID` variable plus a secret
 holding the App's `.pem` private key — not its OAuth client secret, which
 will not work.
 
+## Releases
+
+Commit subjects follow [Conventional Commits](https://www.conventionalcommits.org/)
+— [release-please](https://github.com/googleapis/release-please) reads them
+from [`release-please.yml`](.github/workflows/release-please.yml) and keeps a
+release pull request open. Merging it writes `CHANGELOG.md`, bumps the module
+version quoted in [`README.md`](README.md) and
+[`builder-config.yaml`](builder-config.yaml), tags the commit and publishes
+the GitHub release.
+
 ## Third-party code
 
 Two packages are derived from `opentelemetry-collector-contrib` (Copyright

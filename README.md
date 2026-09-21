@@ -235,7 +235,8 @@ For the metrics the receiver emits about *itself*, see
 
 ## Cursors and restarts
 
-Each container stream tracks the timestamp of the last line it delivered, and
+Each container stream tracks how far it has read — the timestamp of the last
+record it delivered, and how many records carried that exact timestamp — and
 resumes from there on reconnect rather than re-reading `since_seconds`. That
 cursor is per container, keyed by namespace, pod name, pod UID and container
 name, so two pods that reuse a name never share one.
@@ -279,10 +280,33 @@ non-fatal at runtime: unreadable state is discarded with a warning and
 collection starts from `since_seconds`, because failing to start is worse than
 re-reading a bounded window.
 
-Expect a small overlap on resume in any case. `SinceTime` is truncated to
-whole seconds, so a line written in the same second as the cursor is read
-again. Resuming re-delivers a line or two rather than skipping any, which is
-the intended trade: duplicates are recoverable downstream, gaps are not.
+A reconnect always re-reads a little. `SinceTime` is a whole-second field and
+the kubelet treats that second as inclusive, so the connection starts at the
+*beginning* of the cursor's second rather than after the cursor, and the
+kubelet resends every line written in it. That is not an error path: with the
+default `max_stream_lifetime` a perfectly healthy stream is recycled once an
+hour, so every container would otherwise re-deliver up to a second of its own
+log, every hour, forever.
+
+The receiver drops that overlap rather than forwarding it. Every line the
+kubelet returns is stamped to the nanosecond, and the cursor records how many
+records shared its own timestamp, which together place the resume point
+exactly inside the replayed second. A healthy reconnect therefore delivers no
+duplicates at all.
+
+Asking for the *next* second instead would trade those duplicates for real
+gaps inside the current one, and a byte offset — the exact answer the
+`filelog` receiver has — does not exist over the API server. What remains is
+narrow and always errs toward duplicates, never gaps:
+
+- A line long enough to be split by `max_log_size` is re-delivered in part.
+  Only its first chunk carries the timestamp, so the continuation chunks
+  cannot be placed against the cursor and are forwarded rather than dropped.
+- A cursor restored from a collector older than this behaviour has no record
+  count, so its second is re-read once, after which the count is exact again.
+
+The whole second is still fetched from the kubelet and parsed either way — the
+saving is in what reaches the pipeline, not in what crosses the network.
 
 ## Configuration reference
 
@@ -450,12 +474,12 @@ receivers:
   batch, so continuing to read would let the next successful flush move it past
   the refused records, and no future `SinceTime` would ever ask the kubelet for
   them again — they would be unreachable even though the kubelet still has
-  them. Reconnecting re-reads them instead. The cost is duplicates, because
-  `SinceTime` is truncated to whole seconds; the trade is deliberate, since
-  duplicate records are recoverable downstream and dropped ones are not. It is
-  logged at warn level as `pipeline refused a batch, reconnecting to re-read
-  it`, which is a reliable signal that the pipeline cannot keep up with the
-  configured stream count and batch size.
+  them. Reconnecting re-reads them instead: the cursor still sits before the
+  refused records, so they come back through the filter described in
+  [Cursors and restarts](#cursors-and-restarts) rather than being mistaken for
+  a replay and dropped. It is logged at warn level as `pipeline refused a
+  batch, reconnecting to re-read it`, which is a reliable signal that the
+  pipeline cannot keep up with the configured stream count and batch size.
 
   A **permanent** error is handled the opposite way: the pipeline is saying the
   data itself is unacceptable — a malformed record, a payload an exporter can
@@ -524,7 +548,7 @@ explanation of any field named here. The receiver's own telemetry (the
 | `otelcol_log_connection_errors_total{reason="rbac_denied"}` climbing | The ServiceAccount lacks `get` on `pods/log`, or the pod is outside the namespaces its Role covers | Check the [RBAC](#rbac) grant |
 | `otelcol_log_connection_errors_total{reason="pod_gone"}` climbing | A connect attempt got `404` — the pod is gone but the receiver's pod cache still lists it | Expected in bursts during rollouts; see [Interpreting the metrics](#interpreting-the-metrics) for when it isn't |
 | Memory growth while `memory_limiter` is shedding load | Each retrying stream holds its batch in memory: roughly `max_batch_size` x concurrently retrying streams | Keep `max_batch_size` modest when collecting cluster-wide |
-| Duplicate records after a refused batch | `SinceTime` is truncated to whole seconds when re-reading | Working as intended — duplicates are recoverable downstream, dropped records are not |
+| Duplicate records on reconnect | The replayed second is normally filtered out; what survives it is a line split by `max_log_size`, or a cursor restored from a collector older than this behaviour | Working as intended — see [Cursors and restarts](#cursors-and-restarts); duplicates are recoverable downstream, dropped records are not |
 | Large history re-read on every collector restart | No `storage` extension configured, so cursors are memory-only | Configure `storage` — see [Cursors and restarts](#cursors-and-restarts) |
 | Duplicate records across collector replicas | Every replica discovers and streams the same pods; nothing coordinates them | Run a single replica — see [Known limitations](#known-limitations) |
 | A stream shows as active but delivers nothing | The connection stayed open but went mute — no error, so backoff never fires | Recycling handles it within `max_stream_lifetime`; lower it if an hour of silence is too long |
@@ -608,8 +632,8 @@ network error, and is only interesting if it fails to decay.
   often: API server rollouts, kubelet restarts, and load balancer idle
   timeouts all end a stream that a reader on the node would never have noticed.
 
-  Ordinary disconnects cost nothing. `reconnect_backoff` reconnects and
-  `SinceTime` resumes from the last delivered line, so a control plane restart
+  Ordinary disconnects cost nothing. `reconnect_backoff` reconnects and the
+  cursor resumes from the last delivered record, so a control plane restart
   or an idle-timeout reap is a gap of seconds. Lines are only lost when an
   outage outlasts the kubelet's retention window — a sustained network
   partition, or the collector itself being down long enough — which is the

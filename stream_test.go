@@ -15,10 +15,11 @@ import (
 	"go.uber.org/zap"
 	"k8s.io/client-go/kubernetes/fake"
 
+	"github.com/eugenekurasov/k8spodlogreceiver/internal/cursor"
 	"github.com/eugenekurasov/k8spodlogreceiver/internal/logline"
 )
 
-func lifetimeStream(t *testing.T, lifetime time.Duration, consume func(context.Context, io.Reader, logline.Meta, func(time.Time)) (time.Time, error)) *containerStream {
+func lifetimeStream(t *testing.T, lifetime time.Duration, consume func(context.Context, io.Reader, logline.Meta, cursor.Cursor, func(cursor.Cursor)) (cursor.Cursor, error)) *containerStream {
 	t.Helper()
 	return &containerStream{
 		client:            fake.NewSimpleClientset(),
@@ -40,12 +41,12 @@ func TestRun_RecyclesConnectionWhenLifetimeElapses(t *testing.T) {
 	var mu sync.Mutex
 	connections := 0
 
-	s := lifetimeStream(t, 30*time.Millisecond, func(ctx context.Context, _ io.Reader, _ logline.Meta, _ func(time.Time)) (time.Time, error) {
+	s := lifetimeStream(t, 30*time.Millisecond, func(ctx context.Context, _ io.Reader, _ logline.Meta, _ cursor.Cursor, _ func(cursor.Cursor)) (cursor.Cursor, error) {
 		mu.Lock()
 		connections++
 		mu.Unlock()
 		<-ctx.Done() // mute stream: never returns on its own
-		return time.Time{}, ctx.Err()
+		return cursor.Cursor{}, ctx.Err()
 	})
 
 	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
@@ -63,12 +64,12 @@ func TestRun_WithoutLifetimeCapFollowsMuteConnection(t *testing.T) {
 	var mu sync.Mutex
 	connections := 0
 
-	s := lifetimeStream(t, 0, func(ctx context.Context, _ io.Reader, _ logline.Meta, _ func(time.Time)) (time.Time, error) {
+	s := lifetimeStream(t, 0, func(ctx context.Context, _ io.Reader, _ logline.Meta, _ cursor.Cursor, _ func(cursor.Cursor)) (cursor.Cursor, error) {
 		mu.Lock()
 		connections++
 		mu.Unlock()
 		<-ctx.Done()
-		return time.Time{}, ctx.Err()
+		return cursor.Cursor{}, ctx.Err()
 	})
 
 	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Millisecond)
@@ -81,17 +82,17 @@ func TestRun_WithoutLifetimeCapFollowsMuteConnection(t *testing.T) {
 }
 
 // A recycle must resume from the last delivered line, not re-read from the
-// configured backfill window.
+// configured backfill window — and it must carry the count of records already
+// delivered at that timestamp, which is what the next connection filters the
+// replayed second against.
 func TestRun_RecycleResumesFromCursor(t *testing.T) {
-	delivered := time.Date(2026, 8, 30, 12, 0, 0, 0, time.UTC)
+	delivered := cursor.Cursor{TS: time.Date(2026, 8, 30, 12, 0, 0, 0, time.UTC), Delivered: 2}
 	var mu sync.Mutex
-	var seenResume []time.Time
+	var seenResume []cursor.Cursor
 
-	// declared first so the consume closure can read the cursor it observes
-	var s *containerStream
-	s = lifetimeStream(t, 25*time.Millisecond, func(ctx context.Context, _ io.Reader, _ logline.Meta, _ func(time.Time)) (time.Time, error) {
+	s := lifetimeStream(t, 25*time.Millisecond, func(ctx context.Context, _ io.Reader, _ logline.Meta, resume cursor.Cursor, _ func(cursor.Cursor)) (cursor.Cursor, error) {
 		mu.Lock()
-		seenResume = append(seenResume, s.resumeFrom)
+		seenResume = append(seenResume, resume)
 		mu.Unlock()
 		<-ctx.Done()
 		return delivered, ctx.Err()
@@ -105,8 +106,8 @@ func TestRun_RecycleResumesFromCursor(t *testing.T) {
 	defer mu.Unlock()
 	require.Greater(t, len(seenResume), 1, "expected at least one recycle")
 	assert.True(t, seenResume[0].IsZero(), "first connection starts from the backfill window")
-	for i, ts := range seenResume[1:] {
-		assert.Equal(t, delivered, ts, "reconnect %d must resume from the last delivered line", i+1)
+	for i, c := range seenResume[1:] {
+		assert.Equal(t, delivered, c, "reconnect %d must resume from the last delivered line", i+1)
 	}
 }
 
@@ -181,7 +182,7 @@ func TestRun_RestartCountIsRereadOnEachConnection(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	s := lifetimeStream(t, 0, func(_ context.Context, _ io.Reader, m logline.Meta, _ func(time.Time)) (time.Time, error) {
+	s := lifetimeStream(t, 0, func(_ context.Context, _ io.Reader, m logline.Meta, _ cursor.Cursor, _ func(cursor.Cursor)) (cursor.Cursor, error) {
 		mu.Lock()
 		seen = append(seen, m.RestartCount)
 		restarts++ // the container restarts between every connection
@@ -190,7 +191,7 @@ func TestRun_RestartCountIsRereadOnEachConnection(t *testing.T) {
 		if done {
 			cancel()
 		}
-		return time.Time{}, io.EOF // stream ended: reconnect
+		return cursor.Cursor{}, io.EOF // stream ended: reconnect
 	})
 	s.restartCount = func() int32 {
 		mu.Lock()

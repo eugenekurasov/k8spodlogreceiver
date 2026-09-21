@@ -30,6 +30,7 @@ import (
 	"k8s.io/client-go/rest"
 
 	"github.com/eugenekurasov/k8spodlogreceiver/internal/consumerretry"
+	"github.com/eugenekurasov/k8spodlogreceiver/internal/cursor"
 	"github.com/eugenekurasov/k8spodlogreceiver/internal/k8sconfig"
 	"github.com/eugenekurasov/k8spodlogreceiver/internal/logline"
 	"github.com/eugenekurasov/k8spodlogreceiver/internal/metadata"
@@ -70,10 +71,10 @@ type logsReceiver struct {
 	// completed init container, a short Job) still has logs nobody has read.
 	drainedContainers map[string]struct{}
 	// cursors is where each container's progress lives, along with its
-	// persistence and expiry; see cursorStore. It has its own lock and is
+	// persistence and expiry; see cursor.Store. It has its own lock and is
 	// safe to use without holding r.mu — r.mu is still taken around it where
 	// a write has to be fenced against the receiver's own state.
-	cursors *cursorStore
+	cursors *cursor.Store
 	// restartCounts caches the restart count for each container, keyed by
 	// streamKey. Updated on each pod discovery event.
 	restartCounts map[string]int32
@@ -108,7 +109,7 @@ func newLogsReceiver(settings receiver.Settings, cfg *Config, c consumer.Logs) (
 		terminatedContainers: make(map[string]struct{}),
 		drainedContainers:    make(map[string]struct{}),
 		// Memory-only until Start resolves the configured storage extension.
-		cursors:       newCursorStore(nil, settings.Logger),
+		cursors:       cursor.NewStore(nil, settings.Logger, podUIDFromStreamKey),
 		restartCounts: make(map[string]int32),
 		obsrep:        obsrep,
 		telemetry:     telemetryBuilder,
@@ -118,14 +119,14 @@ func newLogsReceiver(settings receiver.Settings, cfg *Config, c consumer.Logs) (
 }
 
 func (r *logsReceiver) Start(ctx context.Context, host component.Host) error {
-	client, err := openCursorStorage(ctx, host, r.cfg.StorageID, r.settings.ID)
+	client, err := cursor.OpenStorage(ctx, host, r.cfg.StorageID, r.settings.ID)
 	if err != nil {
 		return fmt.Errorf("k8spodlogreceiver: %w", err)
 	}
 	// Replaced rather than mutated: nothing can have touched the memory-only
 	// store yet, since no stream exists before this point.
-	r.cursors = newCursorStore(client, r.settings.Logger)
-	r.cursors.load(ctx)
+	r.cursors = cursor.NewStore(client, r.settings.Logger, podUIDFromStreamKey)
+	r.cursors.Load(ctx)
 
 	restCfg, err := k8sconfig.CreateRestConfig(r.cfg.APIConfig)
 	if err != nil {
@@ -155,7 +156,7 @@ func (r *logsReceiver) Start(ctx context.Context, host component.Host) error {
 	r.wg.Add(1)
 	go r.runCursorPruning(runCtx)
 
-	if r.cursors.persists() {
+	if r.cursors.Persists() {
 		r.wg.Add(1)
 		go r.runCursorFlush(runCtx)
 	}
@@ -193,8 +194,8 @@ func (r *logsReceiver) Shutdown(ctx context.Context) error {
 	// Written after every stream has stopped, so the persisted set includes
 	// each container's final delivered line. ctx here is the shutdown context,
 	// not the cancelled run context, so the write is still allowed to happen.
-	r.cursors.flush(ctx)
-	if err := r.cursors.close(ctx); err != nil {
+	r.cursors.Flush(ctx)
+	if err := r.cursors.Close(ctx); err != nil {
 		r.settings.Logger.Warn("closing cursor storage", zap.Error(err))
 	}
 
@@ -400,7 +401,7 @@ func (r *logsReceiver) onPodDeleted(pod *corev1.Pod, inferred bool) {
 		delete(r.terminatedContainers, key)
 		delete(r.drainedContainers, key)
 		if !inferred {
-			r.cursors.forget(key)
+			r.cursors.Forget(key)
 		}
 	}
 	r.mu.Unlock()
@@ -457,13 +458,14 @@ func initContainerRestartPolicy(pod *corev1.Pod, name string) *corev1.ContainerR
 	return nil
 }
 
-// cursorFor returns the last delivered timestamp for a container, zero if none.
-func (r *logsReceiver) cursorFor(key string) time.Time {
-	return r.cursors.get(key)
+// cursorFor returns how far a container has been read, the zero cursor if it
+// has never been read at all.
+func (r *logsReceiver) cursorFor(key string) cursor.Cursor {
+	return r.cursors.Get(key)
 }
 
-// advanceCursor records the last line delivered for a container, on behalf of
-// the stream generation gen.
+// advanceCursor records how far a container has been read, on behalf of the
+// stream generation gen.
 //
 // The write is fenced on that generation for the same reason releaseStream is:
 // a cancelled stream keeps running until it notices, and flushes its final
@@ -472,9 +474,9 @@ func (r *logsReceiver) cursorFor(key string) time.Time {
 // with entries for pods that no longer exist — or overwrite the cursor now
 // owned by a replacement stream.
 //
-// Zero timestamps and out-of-order writes are the store's business; see
-// cursorStore.advance.
-func (r *logsReceiver) advanceCursor(key string, gen uint64, ts time.Time) {
+// Zero positions and out-of-order writes are the store's business; see
+// cursor.Store.Advance.
+func (r *logsReceiver) advanceCursor(key string, gen uint64, c cursor.Cursor) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
@@ -485,7 +487,7 @@ func (r *logsReceiver) advanceCursor(key string, gen uint64, ts time.Time) {
 	}
 	// Called under r.mu so the fence and the write cannot be interleaved with
 	// a delete. The store never calls back here, so nothing can deadlock on it.
-	r.cursors.advance(key, ts)
+	r.cursors.Advance(key, c)
 }
 
 func (r *logsReceiver) isContainerTerminal(key string) bool {
@@ -514,7 +516,7 @@ func (r *logsReceiver) getRestartCount(key string) int32 {
 // recordPodUIDSeen marks a pod UID as recently seen, deferring the expiry of
 // its containers' cursors.
 func (r *logsReceiver) recordPodUIDSeen(podUID string) {
-	r.cursors.markPodSeen(podUID)
+	r.cursors.MarkPodSeen(podUID)
 }
 
 // runCursorPruning expires the cursors of pods that are long gone, until ctx
@@ -522,7 +524,7 @@ func (r *logsReceiver) recordPodUIDSeen(podUID string) {
 func (r *logsReceiver) runCursorPruning(ctx context.Context) {
 	defer r.wg.Done()
 
-	ticker := time.NewTicker(cursorPruneInterval)
+	ticker := time.NewTicker(cursor.PruneInterval)
 	defer ticker.Stop()
 
 	for {
@@ -530,16 +532,16 @@ func (r *logsReceiver) runCursorPruning(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			r.pruneStaleCursors()
+			r.pruneStaleCursors(time.Now())
 		}
 	}
 }
 
 // pruneStaleCursors expires the cursors of pods the informer has not reported
-// for cursorStaleAfter, and drops the receiver's own per-container state for
+// for cursor.StaleAfter as of now, and drops the receiver's own per-container state for
 // the same keys so the two cannot drift apart.
-func (r *logsReceiver) pruneStaleCursors() {
-	pruned := r.cursors.prune(time.Now().Add(-cursorStaleAfter))
+func (r *logsReceiver) pruneStaleCursors(now time.Time) {
+	pruned := r.cursors.Prune(now.Add(-cursor.StaleAfter))
 	if len(pruned) == 0 {
 		return
 	}
@@ -556,7 +558,7 @@ func (r *logsReceiver) pruneStaleCursors() {
 // runCursorFlush persists cursors periodically until ctx is cancelled.
 func (r *logsReceiver) runCursorFlush(ctx context.Context) {
 	defer r.wg.Done()
-	r.cursors.runFlushLoop(ctx)
+	r.cursors.RunFlushLoop(ctx)
 }
 
 func (r *logsReceiver) streamContainerLogs(ctx context.Context, namespace, podName, podUID, containerName, nodeName, key string, gen uint64) {
@@ -586,8 +588,8 @@ func (r *logsReceiver) newContainerStream(namespace, podName, podUID, containerN
 			zap.String("podUID", podUID),
 			zap.String("node", nodeName),
 		),
-		resumeFrom:        r.cursorFor(key),
-		onDelivered:       func(ts time.Time) { r.advanceCursor(key, gen, ts) },
+		resume:            r.cursorFor(key),
+		onDelivered:       func(c cursor.Cursor) { r.advanceCursor(key, gen, c) },
 		sinceSeconds:      r.cfg.SinceSeconds,
 		backoffCfg:        r.cfg.ReconnectBackoff,
 		maxStreamLifetime: r.cfg.MaxStreamLifetime,
@@ -601,7 +603,7 @@ func (r *logsReceiver) newContainerStream(namespace, podName, podUID, containerN
 
 var errPipelineRefused = errors.New("pipeline refused a batch; reconnecting to re-read it")
 
-func (r *logsReceiver) streamConnection(ctx context.Context, stream io.Reader, m logline.Meta, onProgress func(time.Time)) (lastTS time.Time, _ error) {
+func (r *logsReceiver) streamConnection(ctx context.Context, stream io.Reader, m logline.Meta, resume cursor.Cursor, onProgress func(cursor.Cursor)) (delivered cursor.Cursor, _ error) {
 	maxBatch := r.batchSize()
 	flushInterval := r.flushInterval()
 
@@ -640,7 +642,18 @@ func (r *logsReceiver) streamConnection(ctx context.Context, stream io.Reader, m
 	ticker := time.NewTicker(flushInterval)
 	defer ticker.Stop()
 
-	var batchMaxTS time.Time
+	// The kubelet replays the cursor's whole second on every reconnect; this
+	// drops the part of it that has already been delivered. See cursor.Filter.
+	filter := cursor.NewFilter(resume)
+	// pending is where the cursor stands after every record appended so far,
+	// including the ones still sitting in the unflushed batch. It starts at
+	// resume so a run of records sharing the cursor's timestamp keeps counting
+	// from what the previous connection delivered rather than from one.
+	pending := resume
+	// batchAdvanced says the current batch moved pending, i.e. that flushing
+	// it moves the cursor. A batch of records the kubelet stamped with no
+	// timestamp at all does not.
+	batchAdvanced := false
 	batch := logline.NewBatch(m)
 
 	flush := func() bool {
@@ -651,19 +664,30 @@ func (r *logsReceiver) streamConnection(ctx context.Context, stream io.Reader, m
 		// A dropped batch advances the cursor exactly like a delivered one:
 		// those records are gone either way, and leaving the cursor behind
 		// them would make the next connection re-read them forever.
-		if outcome != batchRefused && !batchMaxTS.IsZero() {
-			lastTS = batchMaxTS
+		if outcome != batchRefused && batchAdvanced {
+			delivered = pending
 			// Reported per delivered batch, not once the connection ends: a
 			// healthy stream stays open for max_stream_lifetime, and a cursor
 			// that only advanced on disconnect would persist an hour-old
 			// position and re-read all of it after an abrupt restart.
 			if onProgress != nil {
-				onProgress(lastTS)
+				onProgress(delivered)
 			}
 		}
 		batch = logline.NewBatch(m)
-		batchMaxTS = time.Time{}
+		batchAdvanced = false
 		return outcome != batchRefused
+	}
+
+	// appendLine counts the record before the pipeline has taken it. That is
+	// safe because the cursor still only moves on flush: a batch this
+	// connection never gets to flush is re-read by the next one, which counts
+	// it again from the same starting point.
+	appendLine := func(item logline.Line) {
+		batch.Append(item.Body, item.Timestamp)
+		if pending.Record(item.Timestamp) {
+			batchAdvanced = true
+		}
 	}
 
 	for {
@@ -676,23 +700,23 @@ func (r *logsReceiver) streamConnection(ctx context.Context, stream io.Reader, m
 				// (live container) or drains the rest of a terminal
 				// container's log (follow) when the stream ended in error.
 				if !flush() {
-					return lastTS, errPipelineRefused
+					return delivered, errPipelineRefused
 				}
-				return lastTS, readErr
+				return delivered, readErr
 			}
-			batch.Append(item.Body, item.Timestamp)
-			if !item.Timestamp.IsZero() {
-				batchMaxTS = item.Timestamp
+			if !filter.Keep(item.Timestamp) {
+				continue
 			}
+			appendLine(item)
 			if batch.Count() >= maxBatch {
 				if !flush() {
-					return lastTS, errPipelineRefused
+					return delivered, errPipelineRefused
 				}
 				ticker.Reset(flushInterval)
 			}
 		case <-ticker.C:
 			if !flush() {
-				return lastTS, errPipelineRefused
+				return delivered, errPipelineRefused
 			}
 		}
 	}

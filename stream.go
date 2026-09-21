@@ -17,6 +17,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 
+	"github.com/eugenekurasov/k8spodlogreceiver/internal/cursor"
 	"github.com/eugenekurasov/k8spodlogreceiver/internal/logline"
 	"github.com/eugenekurasov/k8spodlogreceiver/internal/metadata"
 	"github.com/eugenekurasov/k8spodlogreceiver/internal/retry"
@@ -47,9 +48,11 @@ type containerStream struct {
 	// deliberately closed and reopened; 0 disables the cap.
 	maxStreamLifetime time.Duration
 
-	// consume forwards one open stream's lines to the pipeline and returns the
-	// timestamp of the last delivered line (logsReceiver.streamConnection).
-	consume func(ctx context.Context, stream io.Reader, m logline.Meta, onProgress func(time.Time)) (time.Time, error)
+	// consume forwards one open stream's lines to the pipeline and returns how
+	// far it got (logsReceiver.streamConnection). resume is where this
+	// connection left off, which is also what consume filters the re-read
+	// overlap against; see cursor.Filter.
+	consume func(ctx context.Context, stream io.Reader, m logline.Meta, resume cursor.Cursor, onProgress func(cursor.Cursor)) (cursor.Cursor, error)
 	// isTerminal reports whether this container has been marked terminated.
 	isTerminal func() bool
 	// restartCount reports the container's current restart count. It is read
@@ -61,15 +64,15 @@ type containerStream struct {
 	restartCount func() int32
 	// onDelivered publishes the cursor so it outlives this stream: a
 	// replacement started after a watch break resumes from it.
-	onDelivered func(time.Time)
+	onDelivered func(cursor.Cursor)
 
 	// backoff is the wait before the next connect attempt; it grows while
 	// connects fail and resets to InitialInterval once one succeeds.
 	backoff time.Duration
-	// resumeFrom is the timestamp of the last line delivered to the pipeline.
-	// While zero the stream starts from sinceSeconds; afterwards each
-	// reconnect resumes right after that line.
-	resumeFrom time.Time
+	// resume is how far the pipeline has been fed. While zero the stream
+	// starts from sinceSeconds; afterwards each reconnect asks the kubelet for
+	// the cursor's second onwards and drops what it has already delivered.
+	resume cursor.Cursor
 	// retryingSince is when the current run of failed connects began, and is
 	// zero while connects succeed. Measured against MaxElapsedTime.
 	retryingSince time.Time
@@ -113,7 +116,8 @@ func (s *containerStream) run(ctx context.Context) {
 			// than waiting out a backoff earned by errors.
 			s.logger.Debug("stream lifetime reached, reconnecting",
 				zap.Duration("max_stream_lifetime", s.maxStreamLifetime),
-				zap.Time("resume_from", s.resumeFrom),
+				zap.Time("resume_from", s.resume.TS),
+				zap.Int("resume_skip", s.resume.Delivered),
 			)
 			continue
 		}
@@ -165,7 +169,7 @@ func (s *containerStream) open(ctx context.Context) (io.ReadCloser, error) {
 		Follow:     true,
 		Timestamps: true,
 	}
-	opts.SinceTime, opts.SinceSeconds = streamStartPoint(s.resumeFrom, s.sinceSeconds, time.Now())
+	opts.SinceTime, opts.SinceSeconds = streamStartPoint(s.resume.TS, s.sinceSeconds, time.Now())
 
 	req := s.client.CoreV1().Pods(s.meta.Namespace).GetLogs(s.meta.PodName, opts)
 	return req.Stream(ctx)
@@ -185,7 +189,9 @@ func (s *containerStream) open(ctx context.Context) (io.ReadCloser, error) {
 func streamStartPoint(resumeFrom time.Time, sinceSeconds *int64, now time.Time) (*metav1.Time, *int64) {
 	switch {
 	case !resumeFrom.IsZero():
-		// Reconnect: resume just after the last line already delivered.
+		// Reconnect. metav1.Time only carries whole seconds, so this asks for
+		// the cursor's whole second inclusive rather than for the line after
+		// the cursor; the overlap it returns is dropped by cursor.Filter.
 		t := metav1.NewTime(resumeFrom)
 		return &t, nil
 	case sinceSeconds != nil && *sinceSeconds == 0:
@@ -230,19 +236,20 @@ func (s *containerStream) follow(ctx, connCtx context.Context, stream io.ReadClo
 	s.retryingSince = time.Time{}
 	s.backoff = s.backoffCfg.InitialInterval
 
-	lastTS, scanErr := s.consume(connCtx, stream, s.meta, s.onDelivered)
+	last, scanErr := s.consume(connCtx, stream, s.meta, s.resume, s.onDelivered)
 	_ = stream.Close()
-	if !lastTS.IsZero() {
-		s.resumeFrom = lastTS
+	if !last.IsZero() {
+		s.resume = last
 		if s.onDelivered != nil {
-			s.onDelivered(lastTS)
+			s.onDelivered(last)
 		}
 	}
 
 	switch {
 	case errors.Is(scanErr, errPipelineRefused):
 		s.logger.Warn("pipeline refused a batch, reconnecting to re-read it",
-			zap.Time("resume_from", s.resumeFrom),
+			zap.Time("resume_from", s.resume.TS),
+			zap.Int("resume_skip", s.resume.Delivered),
 		)
 	case scanErr != nil:
 		s.logger.Debug("log stream ended, reconnecting", zap.Error(scanErr))
@@ -263,15 +270,17 @@ func (s *containerStream) follow(ctx, connCtx context.Context, stream io.ReadClo
 }
 
 // drainTerminalLogs does one non-follow read of a terminated container's logs
-// to pick up lines written after resumeFrom that the broken stream missed.
+// to pick up lines written past the cursor that the broken stream missed. It
+// starts from the same whole second a reconnect would, so it needs the same
+// overlap filtering — which is why it passes the cursor through consume too.
 func (s *containerStream) drainTerminalLogs(ctx context.Context) {
 	opts := &corev1.PodLogOptions{
 		Container:  s.meta.ContainerName,
 		Follow:     false,
 		Timestamps: true,
 	}
-	if !s.resumeFrom.IsZero() {
-		t := metav1.NewTime(s.resumeFrom)
+	if !s.resume.IsZero() {
+		t := metav1.NewTime(s.resume.TS)
 		opts.SinceTime = &t
 	}
 
@@ -283,8 +292,8 @@ func (s *containerStream) drainTerminalLogs(ctx context.Context) {
 	}
 	defer func() { _ = stream.Close() }()
 
-	lastTS, _ := s.consume(ctx, stream, s.meta, s.onDelivered)
-	if !lastTS.IsZero() {
-		s.resumeFrom = lastTS
+	last, _ := s.consume(ctx, stream, s.meta, s.resume, s.onDelivered)
+	if !last.IsZero() {
+		s.resume = last
 	}
 }

@@ -32,6 +32,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 
+	"github.com/eugenekurasov/k8spodlogreceiver/internal/cursor"
 	"github.com/eugenekurasov/k8spodlogreceiver/internal/logline"
 	"github.com/eugenekurasov/k8spodlogreceiver/internal/metadata"
 	"github.com/eugenekurasov/k8spodlogreceiver/internal/metadatatest"
@@ -43,7 +44,7 @@ func newTestReceiver() *logsReceiver {
 		activeStreams:        make(map[string]streamHandle),
 		terminatedContainers: make(map[string]struct{}),
 		drainedContainers:    make(map[string]struct{}),
-		cursors:              newCursorStore(nil, zap.NewNop()),
+		cursors:              cursor.NewStore(nil, zap.NewNop(), podUIDFromStreamKey),
 		restartCounts:        make(map[string]int32),
 	}
 	r.startStream = func(_ context.Context, _, _, _, _, _, _ string, _ uint64) {
@@ -56,12 +57,17 @@ func newTestReceiver() *logsReceiver {
 // normal fenced path, mirroring what a running stream does. It returns the
 // generation so a test can also write as a *stale* stream.
 func seedCursor(r *logsReceiver, key string, ts time.Time) uint64 {
+	return seedCursorAt(r, key, cursor.Cursor{TS: ts, Delivered: 1})
+}
+
+// seedCursorAt is seedCursor for tests that care about the record count too.
+func seedCursorAt(r *logsReceiver, key string, c cursor.Cursor) uint64 {
 	r.mu.Lock()
 	r.nextStreamGen++
 	gen := r.nextStreamGen
 	r.activeStreams[key] = streamHandle{cancel: func() {}, gen: gen}
 	r.mu.Unlock()
-	r.advanceCursor(key, gen, ts)
+	r.advanceCursor(key, gen, c)
 	return gen
 }
 
@@ -204,7 +210,7 @@ func TestOnPodDeleted_CancelsAndRemovesStream(t *testing.T) {
 		activeStreams: map[string]streamHandle{
 			podKey(pod, "app"): {cancel: func() { cancelled = true }},
 		},
-		cursors: newCursorStore(nil, zap.NewNop()),
+		cursors: cursor.NewStore(nil, zap.NewNop(), podUIDFromStreamKey),
 	}
 
 	r.onPodDeleted(pod, false)
@@ -220,7 +226,7 @@ func TestOnPodDeleted_CancelsAndRemovesStream(t *testing.T) {
 func TestOnPodDeleted_UnknownPod_NoPanic(t *testing.T) {
 	r := &logsReceiver{
 		activeStreams: make(map[string]streamHandle),
-		cursors:       newCursorStore(nil, zap.NewNop()),
+		cursors:       cursor.NewStore(nil, zap.NewNop(), podUIDFromStreamKey),
 	}
 	require.NotPanics(t, func() {
 		r.onPodDeleted(makePod("default", "ghost", "app"), false)
@@ -235,7 +241,7 @@ func TestOnPodDeleted_MultiContainer(t *testing.T) {
 			podKey(pod, "a"): {cancel: func() { cancelledA = true }},
 			podKey(pod, "b"): {cancel: func() { cancelledB = true }},
 		},
-		cursors: newCursorStore(nil, zap.NewNop()),
+		cursors: cursor.NewStore(nil, zap.NewNop(), podUIDFromStreamKey),
 	}
 
 	r.onPodDeleted(pod, false)
@@ -521,7 +527,7 @@ func TestCursor_SurvivesInferredDeleteButNotRealOne(t *testing.T) {
 		r := newTestReceiver()
 		seedCursor(r, key, delivered)
 		r.onPodDeleted(pod, true)
-		assert.Equal(t, delivered, r.cursorFor(key),
+		assert.Equal(t, delivered, r.cursorFor(key).TS,
 			"a delete the informer only inferred is not evidence the pod is gone")
 	})
 
@@ -543,11 +549,18 @@ func TestAdvanceCursor_NeverMovesBackwards(t *testing.T) {
 	earlier := later.Add(-time.Minute)
 
 	gen := seedCursor(r, key, later)
-	r.advanceCursor(key, gen, earlier)
-	assert.Equal(t, later, r.cursorFor(key))
+	r.advanceCursor(key, gen, cursor.Cursor{TS: earlier, Delivered: 9})
+	assert.Equal(t, later, r.cursorFor(key).TS)
 
-	r.advanceCursor(key, gen, time.Time{})
-	assert.Equal(t, later, r.cursorFor(key), "a zero timestamp must not clear the cursor")
+	r.advanceCursor(key, gen, cursor.Cursor{})
+	assert.Equal(t, later, r.cursorFor(key).TS, "a zero position must not clear the cursor")
+
+	// Within one timestamp the record count is what moves the cursor, and it
+	// must not rewind either: a lower count would replay records the pipeline
+	// already has.
+	r.advanceCursor(key, gen, cursor.Cursor{TS: later, Delivered: 4})
+	r.advanceCursor(key, gen, cursor.Cursor{TS: later, Delivered: 2})
+	assert.Equal(t, 4, r.cursorFor(key).Delivered)
 }
 
 // The replacement stream must actually be seeded with the remembered cursor.
@@ -559,11 +572,11 @@ func TestNewContainerStream_SeedsResumeFromCursor(t *testing.T) {
 	seedCursor(r, key, delivered)
 
 	cs := r.newContainerStream("ns", "pod", "uid", "c", "node", key, 99)
-	assert.Equal(t, delivered, cs.resumeFrom,
+	assert.Equal(t, delivered, cs.resume.TS,
 		"a restarted stream must resume from the remembered cursor, not the backfill window")
 
 	fresh := r.newContainerStream("ns", "other", "uid2", "c", "node", streamKey("ns", "other", "uid2", "c"), 100)
-	assert.True(t, fresh.resumeFrom.IsZero(), "an unknown container starts from the backfill window")
+	assert.True(t, fresh.resume.IsZero(), "an unknown container starts from the backfill window")
 }
 
 // A cancelled stream keeps running until it notices, then flushes its final
@@ -579,7 +592,7 @@ func TestCursor_LateFlushFromStoppedStreamIsIgnored(t *testing.T) {
 	require.True(t, r.cursorFor(key).IsZero(), "a real delete drops the cursor")
 
 	// The stream, still unwinding, delivers its last buffered batch.
-	r.advanceCursor(key, gen, time.Date(2026, 8, 30, 12, 0, 5, 0, time.UTC))
+	r.advanceCursor(key, gen, cursor.Cursor{TS: time.Date(2026, 8, 30, 12, 0, 5, 0, time.UTC), Delivered: 1})
 	assert.True(t, r.cursorFor(key).IsZero(),
 		"a stream that no longer owns the key must not write to it")
 }
@@ -597,8 +610,8 @@ func TestCursor_StaleStreamCannotOverwriteReplacement(t *testing.T) {
 	seedCursor(r, key, newer)
 
 	// The stale stream flushes even later data it read on its own connection.
-	r.advanceCursor(key, staleGen, time.Date(2026, 8, 30, 12, 2, 0, 0, time.UTC))
-	assert.Equal(t, newer, r.cursorFor(key), "only the stream that owns the key may advance it")
+	r.advanceCursor(key, staleGen, cursor.Cursor{TS: time.Date(2026, 8, 30, 12, 2, 0, 0, time.UTC), Delivered: 1})
+	assert.Equal(t, newer, r.cursorFor(key).TS, "only the stream that owns the key may advance it")
 }
 
 func TestIsContainerTerminal_Unknown_ReturnsFalse(t *testing.T) {
@@ -827,15 +840,15 @@ func TestStreamConnection_ReportsProgressPerBatch(t *testing.T) {
 		fmt.Fprintf(&input, "2026-08-30T12:00:0%dZ line-%d\n", i, i)
 	}
 
-	var progress []time.Time
-	lastTS, err := r.streamConnection(context.Background(), strings.NewReader(input.String()),
+	var progress []cursor.Cursor
+	last, err := r.streamConnection(context.Background(), strings.NewReader(input.String()),
 		logline.Meta{Namespace: "ns", PodName: "pod", PodUID: "uid", ContainerName: "c"},
-		func(ts time.Time) { progress = append(progress, ts) })
+		cursor.Cursor{}, func(c cursor.Cursor) { progress = append(progress, c) })
 	require.NoError(t, err)
 
 	require.GreaterOrEqual(t, len(progress), 2,
 		"6 lines at batch size 2 must report progress more than once, got %v", progress)
-	assert.Equal(t, lastTS, progress[len(progress)-1],
+	assert.Equal(t, last, progress[len(progress)-1],
 		"the final report must match the returned cursor")
 	for i := 1; i < len(progress); i++ {
 		assert.True(t, progress[i].After(progress[i-1]), "progress must move forward")
@@ -859,7 +872,7 @@ func TestStreamConnection_BatchesLinesBySize(t *testing.T) {
 		b.WriteString("line\n")
 	}
 	_, scanErr := r.streamConnection(context.Background(), strings.NewReader(b.String()),
-		logline.Meta{Namespace: "ns", PodName: "pod", PodUID: "uid", ContainerName: "c"}, nil)
+		logline.Meta{Namespace: "ns", PodName: "pod", PodUID: "uid", ContainerName: "c"}, cursor.Cursor{}, nil)
 
 	require.NoError(t, scanErr)
 	assert.Equal(t, 2, len(sink.AllLogs()), "6 lines / batch 3 should produce 2 batches")
@@ -889,7 +902,7 @@ func TestStreamConnection_FlushesPartialBatchByInterval(t *testing.T) {
 	}()
 
 	_, scanErr := r.streamConnection(context.Background(), pr,
-		logline.Meta{Namespace: "ns", PodName: "pod", PodUID: "uid", ContainerName: "c"}, nil)
+		logline.Meta{Namespace: "ns", PodName: "pod", PodUID: "uid", ContainerName: "c"}, cursor.Cursor{}, nil)
 
 	require.NoError(t, scanErr)
 	require.GreaterOrEqual(t, len(sink.AllLogs()), 1, "partial batch must be flushed by the interval")
@@ -905,12 +918,12 @@ func TestStreamConnection_AdvancesCursorToLastTimestampOnSuccess(t *testing.T) {
 	}
 
 	input := "2024-01-15T10:00:04.900000000Z a\n2024-01-15T10:00:05.800000000Z b\n"
-	lastTS, _ := r.streamConnection(context.Background(), strings.NewReader(input),
-		logline.Meta{Namespace: "ns", PodName: "pod", PodUID: "uid", ContainerName: "c"}, nil)
+	last, _ := r.streamConnection(context.Background(), strings.NewReader(input),
+		logline.Meta{Namespace: "ns", PodName: "pod", PodUID: "uid", ContainerName: "c"}, cursor.Cursor{}, nil)
 
 	want, err := time.Parse(time.RFC3339Nano, "2024-01-15T10:00:05.800000000Z")
 	require.NoError(t, err)
-	assert.True(t, lastTS.Equal(want), "cursor must advance to the newest delivered line, got %v", lastTS)
+	assert.True(t, last.TS.Equal(want), "cursor must advance to the newest delivered line, got %v", last.TS)
 }
 
 // TestStreamConnection_StripsTimestampPrefixFromBody guards against the leading
@@ -927,7 +940,7 @@ func TestStreamConnection_StripsTimestampPrefixFromBody(t *testing.T) {
 
 	input := "2024-01-15T10:00:04.900000000Z hello world\n"
 	_, scanErr := r.streamConnection(context.Background(), strings.NewReader(input),
-		logline.Meta{Namespace: "ns", PodName: "pod", PodUID: "uid", ContainerName: "c"}, nil)
+		logline.Meta{Namespace: "ns", PodName: "pod", PodUID: "uid", ContainerName: "c"}, cursor.Cursor{}, nil)
 
 	require.NoError(t, scanErr)
 	require.Equal(t, 1, sink.LogRecordCount())
@@ -951,10 +964,10 @@ func TestStreamConnection_FailedConsumeDoesNotAdvanceCursor(t *testing.T) {
 	}
 
 	input := "2024-01-15T10:00:04.900000000Z a\n2024-01-15T10:00:05.800000000Z b\n"
-	lastTS, _ := r.streamConnection(context.Background(), strings.NewReader(input),
-		logline.Meta{Namespace: "ns", PodName: "pod", PodUID: "uid", ContainerName: "c"}, nil)
+	last, _ := r.streamConnection(context.Background(), strings.NewReader(input),
+		logline.Meta{Namespace: "ns", PodName: "pod", PodUID: "uid", ContainerName: "c"}, cursor.Cursor{}, nil)
 
-	assert.True(t, lastTS.IsZero(), "cursor must not advance when the consumer rejects the batch")
+	assert.True(t, last.IsZero(), "cursor must not advance when the consumer rejects the batch")
 }
 
 // collectBodies flattens every log record body the sink received, in order.
@@ -984,8 +997,8 @@ func TestStreamConnection_SplitsOversizedLineByDefault(t *testing.T) {
 		oversized + "\n" +
 		"2024-01-15T10:00:05.800000000Z c\n"
 
-	lastTS, scanErr := r.streamConnection(context.Background(), strings.NewReader(input),
-		logline.Meta{Namespace: "ns", PodName: "pod", PodUID: "uid", ContainerName: "c"}, nil)
+	last, scanErr := r.streamConnection(context.Background(), strings.NewReader(input),
+		logline.Meta{Namespace: "ns", PodName: "pod", PodUID: "uid", ContainerName: "c"}, cursor.Cursor{}, nil)
 
 	require.NoError(t, scanErr, "oversized line must be handled in-stream, not surfaced as an error that triggers a reconnect")
 
@@ -1006,7 +1019,7 @@ func TestStreamConnection_SplitsOversizedLineByDefault(t *testing.T) {
 	// chunks carry no timestamp of their own).
 	want, err := time.Parse(time.RFC3339Nano, "2024-01-15T10:00:05.800000000Z")
 	require.NoError(t, err)
-	assert.True(t, lastTS.Equal(want), "cursor must advance to the line after the oversized one, got %v", lastTS)
+	assert.True(t, last.TS.Equal(want), "cursor must advance to the line after the oversized one, got %v", last.TS)
 }
 
 // With max_log_size_behavior=truncate an oversized line keeps its head (the
@@ -1029,8 +1042,8 @@ func TestStreamConnection_TruncatesOversizedLineWhenConfigured(t *testing.T) {
 		oversized + "\n" +
 		"2024-01-15T10:00:05.800000000Z c\n"
 
-	lastTS, scanErr := r.streamConnection(context.Background(), strings.NewReader(input),
-		logline.Meta{Namespace: "ns", PodName: "pod", PodUID: "uid", ContainerName: "c"}, nil)
+	last, scanErr := r.streamConnection(context.Background(), strings.NewReader(input),
+		logline.Meta{Namespace: "ns", PodName: "pod", PodUID: "uid", ContainerName: "c"}, cursor.Cursor{}, nil)
 
 	require.NoError(t, scanErr)
 
@@ -1043,7 +1056,7 @@ func TestStreamConnection_TruncatesOversizedLineWhenConfigured(t *testing.T) {
 
 	want, err := time.Parse(time.RFC3339Nano, "2024-01-15T10:00:05.800000000Z")
 	require.NoError(t, err)
-	assert.True(t, lastTS.Equal(want), "cursor must advance to the line after the oversized one, got %v", lastTS)
+	assert.True(t, last.TS.Equal(want), "cursor must advance to the line after the oversized one, got %v", last.TS)
 }
 
 func TestStreamConnection_CancelStopsAndFlushes(t *testing.T) {
@@ -1066,7 +1079,7 @@ func TestStreamConnection_CancelStopsAndFlushes(t *testing.T) {
 	// Must return promptly (reader goroutine exits) and not deadlock.
 	done := make(chan struct{})
 	go func() {
-		_, _ = r.streamConnection(ctx, pr, logline.Meta{Namespace: "ns", PodName: "pod", PodUID: "uid", ContainerName: "c"}, nil)
+		_, _ = r.streamConnection(ctx, pr, logline.Meta{Namespace: "ns", PodName: "pod", PodUID: "uid", ContainerName: "c"}, cursor.Cursor{}, nil)
 		close(done)
 	}()
 	select {
@@ -1109,7 +1122,7 @@ func TestStreamConnection_ConsumeUnblocksOnContextCancel(t *testing.T) {
 
 	done := make(chan struct{})
 	go func() {
-		_, _ = r.streamConnection(ctx, pr, logline.Meta{Namespace: "ns", PodName: "pod", PodUID: "uid", ContainerName: "c"}, nil)
+		_, _ = r.streamConnection(ctx, pr, logline.Meta{Namespace: "ns", PodName: "pod", PodUID: "uid", ContainerName: "c"}, cursor.Cursor{}, nil)
 		close(done)
 	}()
 
@@ -1201,7 +1214,7 @@ func (c *refusingConsumer) ConsumeLogs(_ context.Context, ld plog.Logs) error {
 var errTestRefused = errors.New("data refused due to high memory usage")
 
 // streamConnection must abort the connection when a batch is refused, rather
-// than reading on. Reading on would let a later successful flush advance lastTS
+// than reading on. Reading on would let a later successful flush advance last.TS
 // past the refused records, making them permanently unreachable — the whole
 // point of errPipelineRefused is to force a reconnect that re-reads them.
 func TestStreamConnection_AbortsOnRefusalSoRecordsCanBeReRead(t *testing.T) {
@@ -1221,13 +1234,13 @@ func TestStreamConnection_AbortsOnRefusalSoRecordsCanBeReRead(t *testing.T) {
 			"2026-08-14T10:00:03.000000000Z third\n",
 	))
 
-	lastTS, err := r.streamConnection(context.Background(), stream, logline.Meta{
+	last, err := r.streamConnection(context.Background(), stream, logline.Meta{
 		Namespace: "ns", PodName: "pod", ContainerName: "c",
-	}, nil)
+	}, cursor.Cursor{}, nil)
 
 	require.ErrorIs(t, err, errPipelineRefused, "refusal must abort the connection")
-	assert.Equal(t, "2026-08-14T10:00:01Z", lastTS.UTC().Format(time.RFC3339),
-		"lastTS must stay at the last delivered record so the reconnect re-reads the refused one")
+	assert.Equal(t, "2026-08-14T10:00:01Z", last.TS.UTC().Format(time.RFC3339),
+		"last.TS must stay at the last delivered record so the reconnect re-reads the refused one")
 	assert.Equal(t, []string{"first"}, c.accepted, "third must not be delivered ahead of the gap")
 }
 
@@ -1260,11 +1273,11 @@ func TestStreamConnection_NormalEndIsNotAnAbort(t *testing.T) {
 
 	stream := io.NopCloser(strings.NewReader("2026-08-14T10:00:01.000000000Z only\n"))
 
-	lastTS, err := r.streamConnection(context.Background(), stream, logline.Meta{
+	last, err := r.streamConnection(context.Background(), stream, logline.Meta{
 		Namespace: "ns", PodName: "pod", ContainerName: "c",
-	}, nil)
+	}, cursor.Cursor{}, nil)
 	require.NoError(t, err)
-	assert.Equal(t, "2026-08-14T10:00:01Z", lastTS.UTC().Format(time.RFC3339))
+	assert.Equal(t, "2026-08-14T10:00:01Z", last.TS.UTC().Format(time.RFC3339))
 }
 
 // A stream that ends on its own — a terminal container, an exhausted
@@ -1359,13 +1372,13 @@ func TestStreamConnection_RefusedFinalFlushOnEOFAborts(t *testing.T) {
 			"2026-08-14T10:00:02.000000000Z second\n",
 	))
 
-	lastTS, err := r.streamConnection(context.Background(), stream, logline.Meta{
+	last, err := r.streamConnection(context.Background(), stream, logline.Meta{
 		Namespace: "ns", PodName: "pod", ContainerName: "c",
-	}, nil)
+	}, cursor.Cursor{}, nil)
 
 	require.ErrorIs(t, err, errPipelineRefused,
 		"a refused batch at EOF must not be reported as a clean stream end")
-	assert.True(t, lastTS.IsZero(), "nothing was delivered, so the cursor must not move")
+	assert.True(t, last.IsZero(), "nothing was delivered, so the cursor must not move")
 }
 
 // A container the receiver only ever saw as terminal still has logs nobody has
@@ -1524,14 +1537,14 @@ func TestStreamConnection_PermanentRefusalDropsBatchAndMovesOn(t *testing.T) {
 			"2026-08-14T10:00:03.000000000Z third\n",
 	))
 
-	lastTS, err := r.streamConnection(context.Background(), stream, logline.Meta{
+	last, err := r.streamConnection(context.Background(), stream, logline.Meta{
 		Namespace: "ns", PodName: "pod", ContainerName: "c",
-	}, nil)
+	}, cursor.Cursor{}, nil)
 
 	require.NoError(t, err, "a permanent refusal must not abort the connection into a re-read loop")
 	assert.Equal(t, []string{"second", "third"}, c.accepted,
 		"reading must continue past the dropped batch")
-	assert.Equal(t, "2026-08-14T10:00:03Z", lastTS.UTC().Format(time.RFC3339),
+	assert.Equal(t, "2026-08-14T10:00:03Z", last.TS.UTC().Format(time.RFC3339),
 		"the cursor must end up past the dropped records")
 }
 
@@ -1550,12 +1563,12 @@ func TestStreamConnection_PermanentRefusalOfEveryBatchStillAdvances(t *testing.T
 			"2026-08-14T10:00:02.000000000Z two\n",
 	))
 
-	lastTS, err := r.streamConnection(context.Background(), stream, logline.Meta{
+	last, err := r.streamConnection(context.Background(), stream, logline.Meta{
 		Namespace: "ns", PodName: "pod", ContainerName: "c",
-	}, nil)
+	}, cursor.Cursor{}, nil)
 
 	require.NoError(t, err)
-	assert.Equal(t, "2026-08-14T10:00:02Z", lastTS.UTC().Format(time.RFC3339))
+	assert.Equal(t, "2026-08-14T10:00:02Z", last.TS.UTC().Format(time.RFC3339))
 }
 
 // A permanent refusal reported through the cursor callback must be published
@@ -1568,13 +1581,158 @@ func TestStreamConnection_PermanentRefusalPublishesProgress(t *testing.T) {
 	r.settings = receivertest.NewNopSettings(metadata.Type)
 	r.consumer = &permanentRefuser{refuseFirst: 1}
 
-	var progress []time.Time
+	var progress []cursor.Cursor
 	stream := io.NopCloser(strings.NewReader("2026-08-14T10:00:01.000000000Z poison\n"))
 	_, err := r.streamConnection(context.Background(), stream, logline.Meta{
 		Namespace: "ns", PodName: "pod", ContainerName: "c",
-	}, func(ts time.Time) { progress = append(progress, ts) })
+	}, cursor.Cursor{}, func(c cursor.Cursor) { progress = append(progress, c) })
 
 	require.NoError(t, err)
 	require.Len(t, progress, 1, "the drop must be published as progress")
-	assert.Equal(t, "2026-08-14T10:00:01Z", progress[0].UTC().Format(time.RFC3339))
+	assert.Equal(t, "2026-08-14T10:00:01Z", progress[0].TS.UTC().Format(time.RFC3339))
+}
+
+// ---- resuming without re-delivering the replayed second ----
+
+// consumeInto runs one connection's worth of input through streamConnection
+// and reports the bodies the pipeline received along with the cursor reached.
+func consumeInto(t *testing.T, r *logsReceiver, sink *consumertest.LogsSink, resume cursor.Cursor, input string) (cursor.Cursor, []string) {
+	t.Helper()
+	r.consumer = sink
+	last, err := r.streamConnection(context.Background(), strings.NewReader(input),
+		logline.Meta{Namespace: "ns", PodName: "pod", PodUID: "uid", ContainerName: "c"}, resume, nil)
+	require.NoError(t, err)
+	return last, collectBodies(sink)
+}
+
+// The headline behaviour. SinceTime only carries whole seconds, so a reconnect
+// is served the cursor's entire second — including the lines already
+// delivered. With max_stream_lifetime at its one-hour default that happens on
+// every healthy stream, once an hour, forever. The record count is what turns
+// "somewhere in this second" back into an exact position.
+func TestStreamConnection_ReconnectDoesNotReDeliverTheReplayedSecond(t *testing.T) {
+	r := newTestReceiver()
+	r.settings = receivertest.NewNopSettings(metadata.Type)
+	r.cfg.MaxBatchSize = 10
+	r.cfg.FlushInterval = time.Hour
+
+	// Three lines inside one second, two of them sharing an instant.
+	firstConnection := "2026-08-14T10:00:01.100000000Z a\n" +
+		"2026-08-14T10:00:01.200000000Z b\n" +
+		"2026-08-14T10:00:01.200000000Z c\n"
+
+	resume, bodies := consumeInto(t, r, &consumertest.LogsSink{}, cursor.Cursor{}, firstConnection)
+	require.Equal(t, []string{"a", "b", "c"}, bodies)
+	require.Equal(t, 2, resume.Delivered, "two records carried the cursor's timestamp")
+
+	// The reconnect asks for 10:00:01 and the kubelet replays the whole second
+	// before going on.
+	replay := firstConnection + "2026-08-14T10:00:01.300000000Z d\n"
+
+	next, bodies := consumeInto(t, r, &consumertest.LogsSink{}, resume, replay)
+	assert.Equal(t, []string{"d"}, bodies, "only the tail of the replayed second is new")
+	assert.Equal(t, cursor.Cursor{TS: mustParseTS(t, "2026-08-14T10:00:01.300000000Z"), Delivered: 1}, next)
+}
+
+// Records sharing a timestamp routinely straddle a batch boundary, and the
+// count has to survive it: restarting it at one per batch would under-count
+// the cursor and replay the earlier batches' records on the next connection.
+func TestStreamConnection_RecordCountAccumulatesAcrossBatches(t *testing.T) {
+	r := newTestReceiver()
+	r.settings = receivertest.NewNopSettings(metadata.Type)
+	r.cfg.MaxBatchSize = 2 // four records at one instant span two batches
+	r.cfg.FlushInterval = time.Hour
+
+	input := strings.Repeat("2026-08-14T10:00:01.200000000Z x\n", 4)
+
+	last, bodies := consumeInto(t, r, &consumertest.LogsSink{}, cursor.Cursor{}, input)
+	require.Len(t, bodies, 4)
+	assert.Equal(t, 4, last.Delivered, "every record at the timestamp counts, batches notwithstanding")
+
+	// And the cursor it produced skips exactly those four on the replay.
+	_, bodies = consumeInto(t, r, &consumertest.LogsSink{}, last, input)
+	assert.Empty(t, bodies, "a connection that reads only what it already delivered forwards nothing")
+}
+
+// A permanently dropped batch is progress: the records are gone either way, so
+// they must be counted, or the reconnect re-reads the poison forever.
+func TestStreamConnection_DroppedRecordsStillCount(t *testing.T) {
+	r := newTestReceiver()
+	r.settings = receivertest.NewNopSettings(metadata.Type)
+	r.cfg.MaxBatchSize = 1
+	r.cfg.FlushInterval = time.Hour
+	r.consumer = &permanentRefuser{refuseFirst: 2} // both records rejected for good
+
+	input := strings.Repeat("2026-08-14T10:00:01.200000000Z poison\n", 2)
+	last, err := r.streamConnection(context.Background(), strings.NewReader(input),
+		logline.Meta{Namespace: "ns", PodName: "pod", PodUID: "uid", ContainerName: "c"}, cursor.Cursor{}, nil)
+
+	require.NoError(t, err)
+	assert.Equal(t, 2, last.Delivered, "dropped records have been read and must not be read again")
+}
+
+// The counter must not get ahead of the pipeline. A refused batch is re-read
+// after the reconnect, so the records in it must still be missing from the
+// cursor — otherwise the filter would drop them on the way back in and the
+// refusal would have cost data rather than a retry.
+func TestStreamConnection_RefusedRecordsAreReReadNotFilteredOut(t *testing.T) {
+	r := newTestReceiver()
+	r.settings = receivertest.NewNopSettings(metadata.Type)
+	r.cfg.MaxBatchSize = 1
+	r.cfg.FlushInterval = time.Hour
+	r.consumer = &oneShotRefuser{next: consumertest.NewNop(), refuseOn: 2}
+
+	input := "2026-08-14T10:00:01.200000000Z a\n" +
+		"2026-08-14T10:00:01.200000000Z b\n"
+
+	resume, err := r.streamConnection(context.Background(), strings.NewReader(input),
+		logline.Meta{Namespace: "ns", PodName: "pod", PodUID: "uid", ContainerName: "c"}, cursor.Cursor{}, nil)
+	require.ErrorIs(t, err, errPipelineRefused)
+	require.Equal(t, 1, resume.Delivered, "only the accepted record counts")
+
+	_, bodies := consumeInto(t, r, &consumertest.LogsSink{}, resume, input)
+	assert.Equal(t, []string{"b"}, bodies, "the refused record must come back on the reconnect")
+}
+
+func mustParseTS(t *testing.T, s string) time.Time {
+	t.Helper()
+	parsed, err := time.Parse(time.RFC3339Nano, s)
+	require.NoError(t, err)
+	return parsed
+}
+
+// A cursor restored from storage belongs to a pod that may never be reported
+// again — that is exactly the entry expiry exists for — and matching it back
+// to its pod is pure string work on the key. Container names of different
+// lengths guard against an offset-based match that only lines up for one.
+func TestPodUIDFromStreamKey(t *testing.T) {
+	assert.Equal(t, "uid-1", podUIDFromStreamKey(streamKey("ns", "pod", "uid-1", "c")))
+	assert.Equal(t, "uid-1", podUIDFromStreamKey(streamKey("ns", "pod", "uid-1", "a-much-longer-container-name")))
+	assert.Empty(t, podUIDFromStreamKey("not-a-key"), "anything not built by streamKey matches no pod")
+	assert.Empty(t, podUIDFromStreamKey("ns/pod/uid/c/extra"))
+}
+
+// The receiver drops its own per-container state for exactly the keys the
+// store expired, so the two cannot drift apart.
+func TestPruneStaleCursors_ClearsReceiverStateForExpiredKeys(t *testing.T) {
+	r := newTestReceiver()
+	key := streamKey("ns", "pod", "uid-dead", "c")
+
+	r.recordPodUIDSeen("uid-dead")
+	r.cursors.Advance(key, cursor.Cursor{TS: time.Now(), Delivered: 1})
+	r.mu.Lock()
+	r.restartCounts[key] = 3
+	r.terminatedContainers[key] = struct{}{}
+	r.drainedContainers[key] = struct{}{}
+	r.mu.Unlock()
+
+	// Long after the pod was last reported.
+	r.pruneStaleCursors(time.Now().Add(cursor.StaleAfter + time.Hour))
+
+	assert.True(t, r.cursorFor(key).IsZero())
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	assert.NotContains(t, r.restartCounts, key)
+	assert.NotContains(t, r.terminatedContainers, key)
+	assert.NotContains(t, r.drainedContainers, key)
 }

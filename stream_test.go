@@ -30,7 +30,6 @@ func lifetimeStream(t *testing.T, lifetime time.Duration, consume func(context.C
 		consume:           consume,
 		isTerminal:        func() bool { return false },
 		restartCount:      func() int32 { return 0 },
-		backoff:           time.Millisecond,
 		firstAttempt:      true,
 	}
 }
@@ -204,4 +203,58 @@ func TestRun_RestartCountIsRereadOnEachConnection(t *testing.T) {
 	mu.Lock()
 	defer mu.Unlock()
 	assert.Equal(t, []int32{0, 1, 2}, seen)
+}
+
+// A container waiting out its restart delay — 10s by default, up to 5 minutes
+// in a crash loop — is served its whole log and disconnected at once, over and
+// over. Reopening each time at initial_interval polls it about once a second
+// for the whole delay, so a connection that brought nothing new must back off.
+func TestRun_ReconnectWithNothingNewBacksOff(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var mu sync.Mutex
+	connections := 0
+	s := lifetimeStream(t, 0, func(_ context.Context, _ io.Reader, _ logline.Meta, _ cursor.Cursor, _ func(cursor.Cursor)) (cursor.Cursor, error) {
+		mu.Lock()
+		connections++
+		done := connections == 4
+		mu.Unlock()
+		if done {
+			cancel()
+		}
+		return cursor.Cursor{}, nil // the dead instance's log, all of it already read
+	})
+	s.backoffCfg = ReconnectBackoffConfig{InitialInterval: time.Millisecond, MaxInterval: 4 * time.Millisecond}
+
+	s.run(ctx)
+
+	assert.Equal(t, 4*time.Millisecond, s.backoff, "empty reconnects must climb the ladder, up to max_interval")
+}
+
+// The new instance writing is what ends the polling: as soon as a connection
+// delivers, the wait collapses back to the shortest rung so the restarted
+// container is followed closely again.
+func TestRun_ConnectionThatDeliversResetsBackoff(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var mu sync.Mutex
+	connections := 0
+	s := lifetimeStream(t, 0, func(_ context.Context, _ io.Reader, _ logline.Meta, _ cursor.Cursor, _ func(cursor.Cursor)) (cursor.Cursor, error) {
+		mu.Lock()
+		connections++
+		n := connections
+		mu.Unlock()
+		if n < 4 {
+			return cursor.Cursor{}, nil // still waiting out the restart delay
+		}
+		cancel()
+		return cursor.Cursor{TS: time.Date(2026, 9, 24, 9, 0, 0, 0, time.UTC), Delivered: 1}, nil
+	})
+	s.backoffCfg = ReconnectBackoffConfig{InitialInterval: time.Millisecond, MaxInterval: 4 * time.Millisecond}
+
+	s.run(ctx)
+
+	assert.Equal(t, time.Millisecond, s.backoff)
 }

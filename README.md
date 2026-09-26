@@ -421,7 +421,11 @@ receivers:
   (default `max_elapsed_time: 0`): exponential backoff applied when a log
   stream drops (pod restart, kubelet log rotation, transient API server error)
   before reconnecting. The delay ladder starts at `initial_interval`, doubles
-  each failed attempt, and is capped at `max_interval`.
+  each failed attempt, and is capped at `max_interval`. A reconnect that
+  brings back nothing new climbs the same ladder — a container waiting out its
+  restart delay would otherwise be reopened once per `initial_interval` for as
+  long as the wait lasts. Any connection that delivers records drops the wait
+  back to `initial_interval`.
 
   Each wait is **jittered** over the upper half of its interval — a 4s rung
   waits somewhere in [2s, 4s). Without that, a single event that drops every
@@ -644,6 +648,23 @@ network error, and is only interesting if it fails to decay.
   instance's logs — which `kubectl logs --previous` can still show — are not
   backfilled, so any lines the crashed instance emitted before the new stream
   attaches are lost.
+
+  The exposure is narrower than it sounds. A stream that is attached when the
+  container exits is served that instance's log to its end before the
+  connection closes, so an ordinary crash loses nothing. Lines are only
+  unreachable when the receiver was disconnected, or not running at all, at
+  the moment the container died.
+
+  Recovering them on reconnect is a deliberate non-goal. The kubelet retains
+  only the single instance before the current one, so no amount of reading
+  could recover a container that restarted twice while the collector was
+  down — and the extra read would land on exactly the paths where streams
+  break. An API server rollout or a load balancer reaping idle connections
+  drops every stream at once, so the recovery attempt would double the
+  request rate across every container precisely when the control plane is
+  least able to absorb it. One persistent stream per container is the budget
+  this receiver is built to stay inside.
+
 - **Cursor durability is bounded by the flush interval**: with a `storage`
   extension configured, read positions survive a restart — see
   [Cursors and restarts](#cursors-and-restarts). They are written every 30

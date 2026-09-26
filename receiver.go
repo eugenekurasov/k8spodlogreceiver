@@ -596,7 +596,6 @@ func (r *logsReceiver) newContainerStream(namespace, podName, podUID, containerN
 		consume:           r.streamConnection,
 		isTerminal:        func() bool { return r.isContainerTerminal(key) },
 		restartCount:      func() int32 { return r.getRestartCount(key) },
-		backoff:           r.cfg.ReconnectBackoff.InitialInterval,
 		firstAttempt:      true,
 	}
 }

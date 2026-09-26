@@ -19,7 +19,7 @@ dist:
 receivers:
   - gomod: go.opentelemetry.io/collector/receiver/nopreceiver v0.161.0
   - gomod: go.opentelemetry.io/collector/receiver/otlpreceiver v0.161.0
-  - gomod: github.com/eugenekurasov/k8spodlogreceiver v0.1.3 # x-release-please-version
+  - gomod: github.com/eugenekurasov/k8spodlogreceiver v0.2.0 # x-release-please-version
     path: ./
 exporters:
   - gomod: go.opentelemetry.io/collector/exporter/debugexporter v0.161.0

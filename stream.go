@@ -66,8 +66,10 @@ type containerStream struct {
 	// replacement started after a watch break resumes from it.
 	onDelivered func(cursor.Cursor)
 
-	// backoff is the wait before the next connect attempt; it grows while
-	// connects fail and resets to InitialInterval once one succeeds.
+	// backoff is the wait before the next connect attempt: the rung of the
+	// ladder this stream currently stands on, seeded from InitialInterval by
+	// run. It climbs while connects fail or bring back nothing new, and drops
+	// back to InitialInterval as soon as a connection delivers records.
 	backoff time.Duration
 	// resume is how far the pipeline has been fed. While zero the stream
 	// starts from sinceSeconds; afterwards each reconnect asks the kubelet for
@@ -80,6 +82,7 @@ type containerStream struct {
 }
 
 func (s *containerStream) run(ctx context.Context) {
+	s.backoff = s.backoffCfg.InitialInterval
 	for {
 		if ctx.Err() != nil {
 			return
@@ -104,13 +107,31 @@ func (s *containerStream) run(ctx context.Context) {
 			continue
 		}
 
+		before := s.resume
 		keepGoing := s.follow(ctx, connCtx, stream)
 		recycled := s.lifetimeReached(ctx, connCtx)
 		connCancel()
 
+		switch {
+		case s.resume.After(before):
+			// Lines flowed, so whatever backoff earlier failures earned is
+			// spent: the next reconnect starts from the shortest wait again.
+			s.backoff = s.backoffCfg.InitialInterval
+		case !recycled:
+			// A connection that ended by itself with nothing new is what a
+			// container waiting out its restart delay looks like: while it is
+			// down the kubelet serves its whole log and closes at once, so
+			// reconnecting at InitialInterval would reopen it about once a
+			// second for as long as the delay lasts — up to 5 minutes. The
+			// wait grows instead, and the case above collapses it back the
+			// moment the new instance writes.
+			s.backoff = retry.NextBackoff(s.backoff, s.backoffCfg.MaxInterval)
+		}
+
 		if !keepGoing {
 			return
 		}
+
 		if recycled {
 			// A deliberate recycle, not a failure: reconnect at once rather
 			// than waiting out a backoff earned by errors.
@@ -227,14 +248,16 @@ func (s *containerStream) retryAfterConnectError(ctx context.Context, err error)
 	return true
 }
 
-// follow drains one open stream and reports whether the loop should reconnect.
-// follow reads one open stream to completion. connCtx bounds the read itself
+// follow reads one open stream to completion and reports whether the loop
+// should reconnect. connCtx bounds the read itself
 // and may expire early through maxStreamLifetime; ctx bounds the stream as a
 // whole and is what the terminal drain below must use, so a lifetime cap that
 // happens to expire as the container terminates does not cost the final lines.
 func (s *containerStream) follow(ctx, connCtx context.Context, stream io.ReadCloser) bool {
+	// The connect succeeded, so this is no longer a run of failed connects.
+	// The backoff itself is the caller's to set: it turns on whether this
+	// connection delivered anything, which is not known yet.
 	s.retryingSince = time.Time{}
-	s.backoff = s.backoffCfg.InitialInterval
 
 	last, scanErr := s.consume(connCtx, stream, s.meta, s.resume, s.onDelivered)
 	_ = stream.Close()

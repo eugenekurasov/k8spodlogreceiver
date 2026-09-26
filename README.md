@@ -89,7 +89,7 @@ tag:
 
 ```yaml
 receivers:
-  - gomod: github.com/eugenekurasov/k8spodlogreceiver v0.1.3
+  - gomod: github.com/eugenekurasov/k8spodlogreceiver v0.2.0
 ```
 
 <!-- x-release-please-end -->

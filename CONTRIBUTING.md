@@ -1,5 +1,36 @@
 # Contributing
 
+## Make targets
+
+`make help` lists every target; `make check` runs everything that does not
+need a cluster (formatting, lint, SPDX headers, unit tests) and is what the
+pull request checks come down to.
+
+```bash
+make check      # fmt-check + lint + license-check + test
+make test       # unit tests only
+make build      # assemble a local collector containing this receiver
+make generate   # regenerate the mdatagen files from metadata.yaml
+```
+
+`make fmt`, `make lint-fix` and `make license-fix` apply what the
+corresponding check asks for.
+
+The tools those targets need — `golangci-lint`, `addlicense`, `ocb` and
+`mdatagen` — are pinned in the Makefile and installed into `./bin` on first
+use, so they cannot collide with a different version already on your `PATH`,
+and CI lints with the same version you do. `make clean` removes them along
+with the built collector.
+
+Extra `go test` flags go through `GOTESTFLAGS`:
+
+```bash
+make test GOTESTFLAGS="-run TestConfig -v"
+```
+
+The GitHub workflows call these same targets, so what runs locally is what
+runs in CI.
+
 ## Running tests locally
 
 ### Unit tests
@@ -7,7 +38,7 @@
 No external dependencies:
 
 ```bash
-go test -v ./...
+make test
 ```
 
 ### Integration tests
@@ -34,30 +65,30 @@ watch → stream → consumer path.
   export DOCKER_HOST="unix://$HOME/.docker/run/docker.sock"
   ```
 
-**Create a cluster** (any recent `kindest/node` tag works — see
-[kind releases](https://github.com/kubernetes-sigs/kind/releases) for
-current ones):
+**Create a cluster** with the node image the Makefile pins, or override it
+with any recent `kindest/node` tag — see
+[kind releases](https://github.com/kubernetes-sigs/kind/releases) for current
+ones:
 
 ```bash
-kind create cluster --name k8spodlog-test --image kindest/node:v1.34.8
+make kind-up
+make kind-up KIND_NODE_IMAGE=kindest/node:v1.34.11  # a different minor
 ```
 
-**Run the tests** (`-mod=vendor` needs a populated `vendor/` — run
-`go mod vendor` first if you don't already have one):
+**Run the tests:**
 
 ```bash
-go mod vendor  # only if vendor/ doesn't already exist
-go test -v -mod=vendor -tags integration -timeout 180s ./...
+make test-integration
 ```
 
-`kind create cluster` sets `kind-k8spodlog-test` as your current
+Creating the cluster sets `kind-k8spodlog-test` as your current
 `kubectl` context and merges it into `~/.kube/config`, which is what the
 test picks up by default (or set `KUBECONFIG` to point elsewhere).
 
 **Clean up** when done:
 
 ```bash
-kind delete cluster --name k8spodlog-test
+make kind-down
 ```
 
 If you re-run the tests immediately after a previous run, you may see
@@ -68,9 +99,10 @@ and retry.
 
 ## Generated files
 
-The files under `internal/metadata`, `internal/metadatatest`, and the
-`generated_*.go` files are produced by `mdatagen` from
-[`metadata.yaml`](metadata.yaml); regenerate them rather than editing them.
+The files under `internal/metadata`, `internal/metadatatest`,
+`documentation.md` and the `generated_*.go` files are produced by `mdatagen`
+from [`metadata.yaml`](metadata.yaml). Run `make generate` to refresh them
+rather than editing them by hand.
 
 ## Dependency updates
 
@@ -81,9 +113,13 @@ weekday schedule, configured by
 
 Anything released in lockstep is grouped into one pull request, so an
 update to the Collector touches `go.mod`,
-[`builder-config.yaml`](builder-config.yaml),
-[`ci.yml`](.github/workflows/ci.yml) and the versions quoted in the README
-together. That is deliberate — a partial bump does not build.
+[`builder-config.yaml`](builder-config.yaml), the tool versions pinned in the
+[`Makefile`](Makefile) and the versions quoted in the README together. That is
+deliberate — a partial bump does not build.
+
+Those Makefile pins are picked up through `# renovate:` comments above each
+one; keep the comment with the variable when you move or rename it, or the
+version quietly stops being updated.
 
 Renovate authenticates as a GitHub App, which must be installed on the
 repository and needs a `RENOVATE_APP_CLIENT_ID` variable plus a secret

@@ -28,6 +28,11 @@ jobs:
           go-version-file: go.mod
 
       - uses: golangci/golangci-lint-action@v9
+        with:
+          # Kept in step with GOLANGCI_LINT_VERSION in the Makefile, so
+          # `make lint` and this job report the same findings.
+          # renovate: datasource=go depName=github.com/golangci/golangci-lint/v2
+          version: v2.14.0
 
   license-headers:
     name: License headers
@@ -39,15 +44,5 @@ jobs:
         with:
           go-version-file: go.mod
 
-      - name: Install addlicense
-        run: go install github.com/google/addlicense@latest
-
       - name: Check SPDX headers on hand-written Go files
-        run: |
-          # mdatagen-generated files carry no header upstream either, and
-          # regeneration would drop one, so they are excluded.
-          find . -name '*.go' \
-            -not -path './build/*' \
-            -not -path './vendor/*' \
-            -not -name 'generated_*.go' \
-            -print0 | xargs -0 addlicense -check
+        run: make license-check

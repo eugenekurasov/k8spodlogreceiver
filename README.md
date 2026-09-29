@@ -82,8 +82,9 @@ builder --config builder-config.yaml
 
 [`builder-config.yaml`](./builder-config.yaml) in this repo builds a local
 collector from the working tree (`path: ./`) and is what CI builds on every
-change. To use a released version instead, drop the `path` line and pin the
-tag:
+change. From a clone, `make build` runs both steps above with the builder
+version this repository pins. To use a released version instead, drop the
+`path` line and pin the tag:
 
 <!-- x-release-please-start-version -->
 
@@ -125,7 +126,7 @@ token (`auth_type: serviceAccount`, the default). Create one in the namespace
 the collector runs in:
 
 ```bash
-<<EOF | kubectl apply -f -
+cat <<EOF | kubectl apply -f -
 apiVersion: v1
 kind: ServiceAccount
 metadata:
@@ -147,7 +148,7 @@ Without them the API server returns 403 and the receiver reports
 To collect across the whole cluster, bind a ClusterRole:
 
 ```bash
-<<EOF | kubectl apply -f -
+cat <<EOF | kubectl apply -f -
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
@@ -692,6 +693,7 @@ network error, and is only interesting if it fails to decay.
 
 ## Contributing
 
-Running the unit and integration tests, regenerating the `mdatagen` files, and
-the third-party code this repository carries are covered in
-[CONTRIBUTING.md](./CONTRIBUTING.md).
+`make help` lists the development targets — `make check` covers everything a
+pull request is checked on. Running the integration tests against a local
+cluster, regenerating the `mdatagen` files, and the third-party code this
+repository carries are covered in [CONTRIBUTING.md](./CONTRIBUTING.md).

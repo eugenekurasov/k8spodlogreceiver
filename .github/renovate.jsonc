@@ -56,10 +56,20 @@
     },
     {
       "customType": "regex",
-      "description": "ocb version, pinned in CI and repeated in the builder-config header and README",
+      "description": "Tool and image versions pinned in the Makefile and the lint workflow",
+      "managerFilePatterns": ["Makefile", ".github/workflows/lint.yml"],
+      "matchStrings": [
+        // `NAME ?= v1.2.3`, or `NAME ?= repo/image:v1.2.3` for a docker tag.
+        "# renovate: datasource=(?<datasource>\\S+) depName=(?<depName>\\S+)\\s+\\w+ \\?= (?:\\S+:)?(?<currentValue>v\\S+)",
+        // `version: v1.2.3`, the golangci-lint action input.
+        "# renovate: datasource=(?<datasource>\\S+) depName=(?<depName>\\S+)\\s+version: (?<currentValue>v\\S+)"
+      ]
+    },
+    {
+      "customType": "regex",
+      "description": "ocb version, repeated in the builder-config header and README",
       "managerFilePatterns": [
         "builder-config.yaml",
-        ".github/workflows/ci.yml",
         "README.md"
       ],
       "matchStrings": [

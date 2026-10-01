@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.2](https://github.com/eugenekurasov/k8spodlogreceiver/compare/v0.2.1...v0.2.2) (2026-10-01)
+
+
+### Bug Fixes
+
+* **deps:** update all dependencies ([#23](https://github.com/eugenekurasov/k8spodlogreceiver/issues/23)) ([6379b0f](https://github.com/eugenekurasov/k8spodlogreceiver/commit/6379b0f7ea16b714676ac74ebfa928945809e56e))
+
 ## [0.2.1](https://github.com/eugenekurasov/k8spodlogreceiver/compare/v0.2.0...v0.2.1) (2026-09-28)
 
 

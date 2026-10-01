@@ -10,9 +10,9 @@ GOTESTFLAGS ?=
 # `renovate:` comments are what keeps them current.
 
 # renovate: datasource=go depName=go.opentelemetry.io/collector/cmd/builder
-OCB_VERSION ?= v0.161.0
+OCB_VERSION ?= v0.162.0
 # renovate: datasource=go depName=go.opentelemetry.io/collector/cmd/mdatagen
-MDATAGEN_VERSION ?= v0.161.0
+MDATAGEN_VERSION ?= v0.162.0
 # renovate: datasource=go depName=github.com/golangci/golangci-lint/v2
 GOLANGCI_LINT_VERSION ?= v2.14.0
 # renovate: datasource=go depName=github.com/google/addlicense

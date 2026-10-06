@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.2.3](https://github.com/eugenekurasov/k8spodlogreceiver/compare/v0.2.2...v0.2.3) (2026-10-06)
+
+
+### Bug Fixes
+
+* **deps:** update all dependencies to v1.47.0 ([#28](https://github.com/eugenekurasov/k8spodlogreceiver/issues/28)) ([888f1c3](https://github.com/eugenekurasov/k8spodlogreceiver/commit/888f1c314f863a12adaf41b2f472f10ca31b9e55))
+* **e2e:** fix discovery test race and ignore HTTP/2 readLoop in goleak ([#30](https://github.com/eugenekurasov/k8spodlogreceiver/issues/30)) ([3bdaed2](https://github.com/eugenekurasov/k8spodlogreceiver/commit/3bdaed24ce309510a88cdf0864a2d836f93c7f5b))
+
 ## [0.2.2](https://github.com/eugenekurasov/k8spodlogreceiver/compare/v0.2.1...v0.2.2) (2026-10-01)
 
 

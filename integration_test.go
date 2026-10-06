@@ -223,6 +223,9 @@ func TestIntegration_NamespaceFilter(t *testing.T) {
 // are active. Combined with goleak.VerifyTestMain (generated_package_test.go),
 // this exercises full lifecycle teardown on a live cluster and fails the run on
 // any leaked goroutine — across all k8s versions in the integration matrix.
+// The one exception is the HTTP/2 connection read loop, which goleak ignores
+// (see metadata.yaml): Shutdown can only close idle connections, and one still
+// tearing down a cancelled stream may outlive the test.
 func TestIntegration_Shutdown(t *testing.T) {
 	sink, shutdown := startReceiver(t, baseConfig())
 

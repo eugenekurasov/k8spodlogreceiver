@@ -16,7 +16,9 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	apiWatch "k8s.io/apimachinery/pkg/watch"
 	"k8s.io/client-go/kubernetes/fake"
+	k8stesting "k8s.io/client-go/testing"
 	"k8s.io/client-go/tools/cache"
 )
 
@@ -59,12 +61,24 @@ func awaitKey(t *testing.T, ch chan string, what string) string {
 	}
 }
 
-// start runs a Discovery over objects and stops it when the test ends.
+// start runs a Discovery over objects and stops it when the test ends. It
+// returns only once the informer's watch is registered: the fake tracker does
+// not replay deletes that land between the informer's List and Watch, so a
+// test that deletes a pod earlier would wait forever for OnDelete.
 func start(t *testing.T, cfg Config, objects ...runtime.Object) (*fake.Clientset, *recorder) {
 	t.Helper()
 
 	client := fake.NewSimpleClientset(objects...)
 	rec := newRecorder()
+
+	watching := make(chan struct{})
+	var once sync.Once
+	client.PrependWatchReactor("pods", func(action k8stesting.Action) (bool, apiWatch.Interface, error) {
+		watchAction := action.(k8stesting.WatchActionImpl)
+		w, err := client.Tracker().Watch(action.GetResource(), action.GetNamespace(), watchAction.ListOptions)
+		once.Do(func() { close(watching) })
+		return true, w, err
+	})
 
 	ctx, cancel := context.WithCancel(context.Background())
 	var wg sync.WaitGroup
@@ -74,6 +88,12 @@ func start(t *testing.T, cfg Config, objects ...runtime.Object) (*fake.Clientset
 	})
 
 	require.NoError(t, New(client, cfg, zap.NewNop(), rec.handler()).Start(ctx, &wg))
+
+	select {
+	case <-watching:
+	case <-time.After(10 * time.Second):
+		t.Fatal("timed out waiting for the informer to start watching")
+	}
 	return client, rec
 }
 

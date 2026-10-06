@@ -20,6 +20,14 @@ tests:
       kubeconfig_path: testdata/kubeconfig-nontls.yaml
     namespaces: []
     pod_label_selector: ""
+  goleak:
+    ignore:
+      any:
+        # The integration tests use a real k8s client. Shutdown closes only
+        # idle connections, and an HTTP/2 connection whose cancelled stream is
+        # still being torn down is not idle yet, so its readLoop goroutine can
+        # outlive the test.
+        - "golang.org/x/net/http2.(*ClientConn).readLoop"
 
 attributes:
   event_type:

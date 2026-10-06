@@ -90,7 +90,7 @@ version this repository pins. To use a released version instead, drop the
 
 ```yaml
 receivers:
-  - gomod: github.com/eugenekurasov/k8spodlogreceiver v0.2.2
+  - gomod: github.com/eugenekurasov/k8spodlogreceiver v0.2.3
 ```
 
 <!-- x-release-please-end -->

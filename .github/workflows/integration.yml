@@ -46,7 +46,7 @@ jobs:
         run: go mod vendor
 
       - name: Create kind cluster (k8s ${{ matrix.k8s-version }})
-        uses: helm/kind-action@v1.15.0
+        uses: helm/kind-action@v1.15.1
         with:
           node_image: ${{ matrix.kind-image }}
           cluster_name: k8spodlog-test

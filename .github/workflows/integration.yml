@@ -11,7 +11,7 @@ permissions:
 jobs:
   integration:
     name: k8s ${{ matrix.k8s-version }}
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     strategy:
       fail-fast: false  # run all three even if one fails
       matrix:
